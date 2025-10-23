@@ -1,2 +1,41 @@
-<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Poetry, Please</title></head><body><div id="app">Deploy placeholder</div></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Poetry, Please</title>
+  <!-- TODO: Replace with your real Firebase web config -->
+  <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-auth-compat.js"></script>
+  <script>
+    const FIREBASE_CONFIG = {
+      apiKey: "REPLACE_ME",
+      authDomain: "REPLACE_ME.firebaseapp.com",
+      projectId: "REPLACE_ME",
+      storageBucket: "REPLACE_ME.appspot.com",
+      messagingSenderId: "REPLACE_ME",
+      appId: "REPLACE_ME"
+    };
+    firebase.initializeApp(FIREBASE_CONFIG);
+  </script>
+  <link rel="stylesheet" href="/styles.css"/>
+</head>
+<body>
+  <div id="login-screen">
+    <h2>Login</h2>
+    <button id="login-google">Sign in with Google</button>
+  </div>
+  <div id="poetry-screen" style="display:none">
+    <h1>Poetry, Please</h1>
+    <div id="gallery"></div>
+    <div class="button-row">
+      <button id="btn-like">Like</button>
+      <button id="btn-dislike">Dislike</button>
+      <button id="btn-next">Poetry, Please</button>
+      <button id="btn-back">Go Back</button>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
