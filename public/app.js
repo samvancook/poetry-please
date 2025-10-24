@@ -125,11 +125,15 @@ async function fetchDataAnonWrapped(anonId) {
 }
 
 async function getNextAnonymousIdWrapped() {
-  return api('getNextAnonymousId', { method: 'POST' });
+  const res = await api('nextAnonymousId', { method: 'POST' });
+  if (!res?.anonId) {
+    throw new Error('Anonymous ID response malformed');
+  }
+  return res.anonId;
 }
 
 async function submitVoteWrapped(imageId, voteType, userId) {
-  return api('vote', { body: { imageId, voteType, userId } });
+  return api('submitVote', { body: { imageId, voteType, userId } });
 }
 
 async function fetchReleaseCatalogsWrapped() {
@@ -154,9 +158,11 @@ async function loadRandomGraphic() {
     if (user) {
       data = await fetchDataWrapped();
     } else {
-      const anonId =
-        localStorage.getItem('pp_anon') || (await getNextAnonymousIdWrapped());
-      localStorage.setItem('pp_anon', anonId);
+      let anonId = localStorage.getItem('pp_anon');
+      if (!anonId) {
+        anonId = await getNextAnonymousIdWrapped();
+        localStorage.setItem('pp_anon', anonId);
+      }
       data = await fetchDataAnonWrapped(anonId);
     }
 
