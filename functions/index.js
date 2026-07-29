@@ -1,28 +1,308 @@
 import { onRequest } from "firebase-functions/v2/https";
 import express from "express";
 import cors from "cors";
+import { createHash, randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { Readable } from "node:stream";
+import { fileURLToPath } from "node:url";
 
 // Firebase Admin v12 (modular)
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
+import { getStorage, getDownloadURL } from "firebase-admin/storage";
+import { GoogleAuth, Impersonated } from "google-auth-library";
+import {
+  contentIdSlug,
+  detectImageMimeType,
+  detectRemoteMediaMimeType,
+  importGraphicMetadataKey,
+  inferRemoteMimeType,
+} from "./uploader-helpers.js";
 
 /** ====== CONFIG / CONSTANTS ====== */
 const COLLECTIONS = {
   graphics: "graphics",
   excerpts: "excerpts",
+  fullPoems: "fullPoems",
   videos: "videos",
   votes: "votes",
   users: "users",
+  authorProfiles: "authorProfiles",
+  authorInvites: "authorInvites",
+  authorAssets: "authorAssets",
+  contentAssets: "contentAssets",
+  contentClaims: "contentClaims",
+  contentFlags: "contentFlags",
+  contentDuplicates: "contentDuplicates",
+  weaverImportLedger: "weaverImportLedger",
+  contentSubmissions: "contentSubmissions",
+  submissionResponses: "submissionResponses",
+  systemState: "systemState",
 };
 
+const ADMIN_EMAILS = new Set([
+  "sam@buttonpoetry.com",
+]);
+
+const FILE_SIZE_MB = 1024 * 1024;
+const UPLOAD_RULES = {
+  authorPhoto: {
+    allowedMimeTypes: new Set(["image/jpeg", "image/png", "image/webp"]),
+    maxBytes: 5 * FILE_SIZE_MB,
+  },
+  replacementImage: {
+    allowedMimeTypes: new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]),
+    maxBytes: 10 * FILE_SIZE_MB,
+  },
+  libraryGraphic: {
+    allowedMimeTypes: new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]),
+    maxBytes: 15 * FILE_SIZE_MB,
+  },
+  libraryVideo: {
+    allowedMimeTypes: new Set(["video/mp4", "video/quicktime", "video/webm", "video/ogg"]),
+    maxBytes: 400 * FILE_SIZE_MB,
+  },
+  userSubmissionImage: {
+    allowedMimeTypes: new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]),
+    maxBytes: 10 * FILE_SIZE_MB,
+  },
+};
+
+const USER_SUBMISSION_CATALOG = "User submitted";
+const USER_SUBMISSION_TITLE_MAX = 120;
+const USER_SUBMISSION_TEXT_MAX = 2200;
+const USER_SUBMISSION_IMAGE_NOTE_MAX = 600;
+const USER_SUBMISSION_IMAGE_MAX_WIDTH = 3000;
+const USER_SUBMISSION_IMAGE_MAX_HEIGHT = 3000;
+
 /** ====== ADMIN INIT ====== */
-const appAdmin = initializeApp();
+const appAdmin = initializeApp({ storageBucket: "poetry-please.firebasestorage.app" });
 
 // If your Firestore DB is the **default** "(default)", use: getFirestore(appAdmin)
 // If your DB id is really "poetrypleasedatabase", keep the 2nd argument.
 const db = getFirestore(appAdmin, "poetrypleasedatabase");
 const auth = getAuth(appAdmin);
+const storage = getStorage(appAdmin);
+const DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly";
+const runtimeCloudAuth = new GoogleAuth({
+  scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+});
+const directDriveReadAuth = new GoogleAuth({
+  scopes: [DRIVE_READ_SCOPE],
+});
+const CONTENT_CACHE_TTL_MS = 15 * 60 * 1000;
+const CONTENT_SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000;
+const CONTENT_SNAPSHOT_DOC_ID = "content-feed";
+const CONTENT_SNAPSHOT_PATH = "system/content-feed/latest.json";
+const CONTENT_SNAPSHOT_VERSION = 1;
+const FLAGGED_CONTENT_CACHE_TTL_MS = 2 * 60 * 1000;
+const RATINGS_CACHE_TTL_MS = 2 * 60 * 1000;
+const SCOREBOARD_CACHE_TTL_MS = 5 * 60 * 1000;
+const SCOREBOARD_SNAPSHOT_TTL_MS = 30 * 60 * 1000;
+const SCOREBOARD_SNAPSHOT_DOC_ID = "scoreboard";
+const SCOREBOARD_SNAPSHOT_PATH = "system/scoreboard/latest.json";
+const SCOREBOARD_SNAPSHOT_VERSION = 4;
+const CANONICAL_CATALOG_API = "https://button-poetry-catalog-350789123099.us-central1.run.app";
+const CANONICAL_POEM_COUNT_TTL_MS = 6 * 60 * 60 * 1000;
+const canonicalPoemCountCache = new Map();
+let contentCache = {
+  builtAt: 0,
+  payload: null,
+  inFlight: null,
+};
+let contentSnapshotInvalidatedAt = 0;
+let flaggedContentCache = {
+  builtAt: 0,
+  payload: null,
+  inFlight: null,
+};
+let ratingsCache = {
+  builtAt: 0,
+  payload: null,
+  inFlight: null,
+};
+let scoreboardCache = {
+  builtAt: 0,
+  payload: null,
+  inFlight: null,
+};
+
+async function getCanonicalPoemCount(bookTitle) {
+  const poems = await getCanonicalPoems(bookTitle);
+  return poems === null ? null : poems.length;
+}
+
+async function getCanonicalPoems(bookTitle) {
+  const key = normalizeCatalogLookupKey(bookTitle);
+  if (!key || key === "short form 2026") return null;
+  const cached = canonicalPoemCountCache.get(key);
+  if (cached && Date.now() - cached.builtAt < CANONICAL_POEM_COUNT_TTL_MS) return cached.poems;
+
+  try {
+    const poems = await fetchCanonicalPoems(bookTitle);
+    canonicalPoemCountCache.set(key, { builtAt: Date.now(), poems });
+    return poems;
+  } catch (err) {
+    console.warn("canonical_poem_count_failed", bookTitle, err?.message || err);
+    return null;
+  }
+}
+
+async function fetchCanonicalPoems(bookTitle) {
+  const response = await fetch(`${CANONICAL_CATALOG_API}/books/${encodeURIComponent(bookTitle)}/poems?limit=1000`, {
+      signal: AbortSignal.timeout(5000),
+  }
+  );
+  if (!response.ok) throw new Error(`catalog_poems_${response.status}`);
+  const rows = await response.json();
+  return (Array.isArray(rows) ? rows : []).filter((row) => (
+    Number(row?.is_likely_poem) === 1
+    && normalizeKey(row?.content_kind) === "poem"
+    && normalizeText(row?.title)
+    && normalizeText(row?.served_text || row?.cleaned_text || row?.text)
+  ));
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const output = new Array(items.length);
+  let nextIndex = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      output[index] = await mapper(items[index], index);
+    }
+  }));
+  return output;
+}
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const FUNCTION_SOURCE_SHA256 = createHash("sha256")
+  .update(readFileSync(__filename))
+  .digest("hex");
+const BOOK_CATALOG_LOOKUP_ROWS = JSON.parse(
+  readFileSync(path.join(__dirname, "book-catalog-lookup.json"), "utf8")
+);
+const BROKEN_QI_MANIFEST = JSON.parse(
+  readFileSync(path.join(__dirname, "broken-qi-ids.json"), "utf8")
+);
+const BOOK_CATALOG_LOOKUP = new Map();
+const BOOK_CATALOG_SHORTENER_LOOKUP = new Map();
+const BOOK_CATALOG_TITLE_BUCKETS = new Map();
+const BROKEN_QI_IDS = new Set(
+  Array.isArray(BROKEN_QI_MANIFEST?.ids) ? BROKEN_QI_MANIFEST.ids.map((value) => normalizeKey(value)) : []
+);
+const POETRY_PLEASE_API_KEYS = new Set(
+  [
+    process.env.POETRY_PLEASE_API_KEY,
+    process.env.PIG_POETRY_PLEASE_API_KEY,
+  ].map((value) => String(value || "").trim()).filter(Boolean)
+);
+
+for (const record of BOOK_CATALOG_LOOKUP_ROWS) {
+  const authorKey = String(record?.authorKey || "").trim();
+  const shortener = sanitizeDocIdSegment(record?.bookShortener || "");
+  if (shortener && !BOOK_CATALOG_SHORTENER_LOOKUP.has(shortener)) {
+    BOOK_CATALOG_SHORTENER_LOOKUP.set(shortener, record);
+  }
+  const titleKeys = Array.isArray(record?.titleKeys) ? record.titleKeys.filter(Boolean) : [];
+  titleKeys.forEach((titleKey) => {
+    [titleKey, titleKey.replace(/\s+/g, "")].filter(Boolean).forEach((key) => {
+      BOOK_CATALOG_TITLE_BUCKETS.set(key, [
+        ...(BOOK_CATALOG_TITLE_BUCKETS.get(key) || []),
+        record,
+      ]);
+      if (authorKey) {
+        BOOK_CATALOG_LOOKUP.set(`${authorKey}|${key}`, record);
+      }
+    });
+  });
+}
+
+function inferBookShortenerFromFilename(fileName = "") {
+  const upper = String(fileName || "").toUpperCase();
+  const candidates = [...new Set((upper.match(/[A-Z0-9]{2,8}/g) || []).filter(Boolean))];
+  return candidates.find((candidate) => BOOK_CATALOG_SHORTENER_LOOKUP.has(candidate)) || "";
+}
+
+function resolveCatalogBookRecord({ author = "", book = "", bookShortener = "", fileName = "" } = {}) {
+  const normalizedShortener = sanitizeDocIdSegment(bookShortener || inferBookShortenerFromFilename(fileName));
+  if (normalizedShortener && BOOK_CATALOG_SHORTENER_LOOKUP.has(normalizedShortener)) {
+    const shortenerMatch = BOOK_CATALOG_SHORTENER_LOOKUP.get(normalizedShortener);
+    const authorKey = normalizeCatalogLookupKey(author);
+    const authorMatches = !authorKey
+      || normalizeCatalogLookupKey(shortenerMatch.author) === authorKey
+      || normalizeCatalogLookupKey(shortenerMatch.authorKey) === authorKey;
+    if (authorMatches) return shortenerMatch;
+  }
+  const authorKey = normalizeCatalogLookupKey(author);
+  for (const titleKey of buildCatalogTitleLookupKeys(book)) {
+    const bucket = BOOK_CATALOG_TITLE_BUCKETS.get(titleKey) || [];
+    if (!bucket.length) continue;
+    if (!authorKey) return bucket[0];
+    return bucket.find((row) => normalizeCatalogLookupKey(row.author) === authorKey || normalizeCatalogLookupKey(row.authorKey) === authorKey) || bucket[0];
+  }
+  return null;
+}
+
+function canonicalizeAuthorName(value = "") {
+  const author = normalizeText(value);
+  return normalizeKey(author) === "francis dylan waguespeck"
+    ? "Francis Dylan Waguespack"
+    : author;
+}
+
+function resolveCanonicalCatalogMetadata(item = {}) {
+  const match = resolveCatalogBookRecord({
+    author: item.author || "",
+    book: item.book || item.bookTitle || "",
+    bookShortener: item.bookShortener || "",
+    fileName: item.fileName || item.sourceFileName || item.updatedFileName || item.imageId || item.contentId || "",
+  });
+  const originalBook = normalizeText(item.book || item.bookTitle || "");
+  const originalCatalog = normalizeText(item.releaseCatalog || "");
+  const originalShortener = sanitizeDocIdSegment(item.bookShortener || "");
+  const book = normalizeText(match?.title || originalBook);
+  const releaseCatalog = normalizeText(match?.releaseCatalog || item.releaseCatalog || "");
+  const bookShortener = sanitizeDocIdSegment(item.bookShortener || match?.bookShortener || "");
+  const changedFields = [];
+  if (book && normalizeCatalogLookupKey(book) !== normalizeCatalogLookupKey(originalBook)) changedFields.push("book");
+  if (releaseCatalog && normalizeCatalogLookupKey(releaseCatalog) !== normalizeCatalogLookupKey(originalCatalog)) changedFields.push("releaseCatalog");
+  if (bookShortener && bookShortener !== originalShortener) changedFields.push("bookShortener");
+  return {
+    matched: !!match,
+    match,
+    entityType: normalizeText(match?.entityType || "book"),
+    canonicalSource: match?.entityType === "non_book_collection"
+      ? "collection_exception_registry"
+      : "book_catalog_lookup",
+    book,
+    releaseCatalog,
+    bookShortener,
+    bookLink: normalizeText(item.bookLink || match?.bookLink || ""),
+    author: canonicalizeAuthorName(item.author || match?.author || ""),
+    changedFields,
+    matchReason: match
+      ? (sanitizeDocIdSegment(item.bookShortener || inferBookShortenerFromFilename(item.fileName || item.sourceFileName || item.updatedFileName || item.imageId || item.contentId || "")) ? "matched_by_shortener" : "matched_by_author_title")
+      : "unmatched",
+  };
+}
+
+function canonicalizeContentRecord(item = {}) {
+  const canonical = resolveCanonicalCatalogMetadata(item);
+  return {
+    ...item,
+    author: canonical.author || canonicalizeAuthorName(item.author),
+    ...(canonical.matched ? {
+      book: canonical.book || item.book || item.bookTitle || "",
+      releaseCatalog: canonical.releaseCatalog || item.releaseCatalog || "",
+      bookShortener: canonical.bookShortener || item.bookShortener || "",
+      bookLink: item.bookLink || canonical.bookLink || "",
+    } : {}),
+  };
+}
 
 /** ====== EXPRESS / CORS ====== */
 const app = express();
@@ -31,30 +311,55 @@ app.use(
     origin: [
       "https://poetry-please.web.app",
       "https://poetry-please.firebaseapp.com",
+      "https://poetryplease-org.web.app",
+      "https://poetryplease-org.firebaseapp.com",
+      "https://poetryplease.org",
+      "https://www.poetryplease.org",
       "https://buttonpoetry.com",
     ],
     methods: ["GET", "POST", "OPTIONS"],
     credentials: false,
   })
 );
-app.use(express.json());
+app.use(express.json({ limit: "16mb" }));
 
 /** ====== HELPERS ====== */
 function parseDoc(snap) {
   const d = snap.data() || {};
   const imageId = d.imageId || d.imageID || d.videoId || "";
-  const imageUrl = d.imageUrl || d.url || d.driveLink || d.videoUrl || "";
+  const contentId = d.contentId || snap.id || "";
+  const imageUrl = d.imageUrl || d.thumbnailUrl || d.url || d.driveLink || d.videoUrl || "";
   return {
     author: d.author || "",
     title: d.title || d.poem || "",
     book: d.book || "",
     imageId,
+    contentId,
     imageUrl,
     videoUrl: d.videoUrl || "",
+    youtubeUrl: d.youtubeUrl || "",
+    thumbnailUrl: d.thumbnailUrl || "",
+    duration: d.duration || "",
+    channel: d.channel || "",
+    driveLink: d.driveLink || "",
+    cloudLink: d.cloudLink || "",
+    sourceFolderLink: d.sourceFolderLink || "",
+    sourceFileName: d.sourceFileName || "",
+    misc: d.misc || "",
     bookLink: d.bookLink || "",
     releaseCatalog: d.releaseCatalog || "",
+    sourceEvent: d.sourceEvent || "",
+    sourceEventLabel: d.sourceEventLabel || "",
     imageType: d.imageType || "",
     excerpt: d.excerpt || "",
+    youtubeId: d.youtubeId || "",
+    uploadTime: d.uploadTime || "",
+    socialViews: Number(d.socialViews || 0) || 0,
+    socialLikes: Number(d.socialLikes || 0) || 0,
+    socialComments: Number(d.socialComments || 0) || 0,
+    socialDislikes: Number(d.socialDislikes || 0) || 0,
+    socialSyncSource: d.socialSyncSource || "",
+    socialLastSyncedAt: d.socialLastSyncedAt || null,
   };
 }
 
@@ -68,6 +373,722 @@ async function getAllFrom(collection) {
     page = await col.startAfter(last).limit(1000).get();
   }
   return out;
+}
+
+function sampleItems(items, limit) {
+  if (!Array.isArray(items)) return [];
+  if (items.length <= limit) return items.slice();
+  const arr = items.slice();
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr.slice(0, limit);
+}
+
+function excludeBrokenContent(items = []) {
+  return items.filter((item) => {
+    const imageId = normalizeKey(item?.imageId || "");
+    if (!imageId) return true;
+    return !BROKEN_QI_IDS.has(imageId);
+  });
+}
+
+
+async function getAllContent() {
+  const [g, e, fp, v] = await Promise.all([
+    getAllFrom(COLLECTIONS.graphics),
+    getAllFrom(COLLECTIONS.excerpts),
+    getAllFrom(COLLECTIONS.fullPoems),
+    getAllFrom(COLLECTIONS.videos),
+  ]);
+  return [...g, ...e, ...fp, ...v];
+}
+
+function invalidateContentCache() {
+  contentCache.builtAt = 0;
+  contentCache.payload = null;
+  contentCache.inFlight = null;
+  contentSnapshotInvalidatedAt = Date.now();
+  db.collection(COLLECTIONS.systemState).doc(CONTENT_SNAPSHOT_DOC_ID).set({
+    invalidatedAt: FieldValue.serverTimestamp(),
+    builtAt: null,
+  }, { merge: true }).catch((err) => {
+    console.warn("Content snapshot invalidation failed", err);
+  });
+}
+
+async function readContentSnapshot() {
+  const metaSnap = await db.collection(COLLECTIONS.systemState).doc(CONTENT_SNAPSHOT_DOC_ID).get();
+  if (!metaSnap.exists) return null;
+  const meta = metaSnap.data() || {};
+  const builtAtMs = timestampToMs(meta.builtAt);
+  const storagePath = normalizeText(meta.storagePath || CONTENT_SNAPSHOT_PATH);
+  if (!builtAtMs || !storagePath || Number(meta.version || 0) !== CONTENT_SNAPSHOT_VERSION) return null;
+  if (contentSnapshotInvalidatedAt && builtAtMs <= contentSnapshotInvalidatedAt) return null;
+
+  const [buffer] = await storage.bucket().file(storagePath).download();
+  const payload = JSON.parse(buffer.toString("utf8"));
+  if (!Array.isArray(payload)) return null;
+  return { payload, builtAtMs };
+}
+
+async function writeContentSnapshot(payload) {
+  const builtAtMs = Date.now();
+  const file = storage.bucket().file(CONTENT_SNAPSHOT_PATH);
+  await file.save(JSON.stringify(payload), {
+    contentType: "application/json; charset=utf-8",
+    resumable: false,
+    metadata: { cacheControl: "no-store, max-age=0" },
+  });
+  await db.collection(COLLECTIONS.systemState).doc(CONTENT_SNAPSHOT_DOC_ID).set({
+    storagePath: CONTENT_SNAPSHOT_PATH,
+    version: CONTENT_SNAPSHOT_VERSION,
+    builtAt: new Date(builtAtMs),
+    contentCount: payload.length,
+    updatedBy: "server",
+  }, { merge: true });
+  contentSnapshotInvalidatedAt = 0;
+  return builtAtMs;
+}
+
+async function getAllContentCached({ forceRefresh = false } = {}) {
+  const now = Date.now();
+  if (!forceRefresh && contentCache.payload && (now - contentCache.builtAt) < CONTENT_CACHE_TTL_MS) {
+    return contentCache.payload;
+  }
+  if (!forceRefresh && contentCache.inFlight) {
+    return contentCache.inFlight;
+  }
+  contentCache.inFlight = (async () => {
+    const startedAt = Date.now();
+    if (!forceRefresh) {
+      try {
+        const snapshot = await readContentSnapshot();
+        if (snapshot && (now - snapshot.builtAtMs) < CONTENT_SNAPSHOT_TTL_MS) {
+          contentCache.payload = snapshot.payload;
+          // Memory freshness starts when the snapshot is loaded, not when the
+          // durable snapshot was originally built.
+          contentCache.builtAt = Date.now();
+          console.info("Content cache loaded", { source: "snapshot", count: snapshot.payload.length, durationMs: Date.now() - startedAt });
+          return contentCache.payload;
+        }
+      } catch (err) {
+        console.warn("Content snapshot read failed; falling back to Firestore", err);
+      }
+    }
+
+    const payload = (await getAllContent()).map(canonicalizeContentRecord);
+    contentCache.payload = payload;
+    contentCache.builtAt = Date.now();
+    console.info("Content cache loaded", { source: "firestore", count: payload.length, durationMs: Date.now() - startedAt });
+    try {
+      await writeContentSnapshot(payload);
+    } catch (err) {
+      console.warn("Content snapshot write failed", err);
+    }
+    return contentCache.payload;
+  })().finally(() => {
+    contentCache.inFlight = null;
+  });
+  return contentCache.inFlight;
+}
+
+async function findContentRecordByImageId(imageId) {
+  const normalized = normalizeKey(imageId);
+  if (!normalized) return null;
+  for (const collection of [COLLECTIONS.graphics, COLLECTIONS.excerpts, COLLECTIONS.fullPoems, COLLECTIONS.videos]) {
+    const snap = await db.collection(collection).limit(1000).get();
+    const match = snap.docs.find((doc) => {
+      const data = doc.data() || {};
+      const candidate = data.imageId || data.imageID || data.videoId || "";
+      return normalizeKey(candidate) === normalized;
+    });
+    if (match) {
+      return { collection, docId: match.id, data: match.data() || {} };
+    }
+  }
+  return null;
+}
+
+function extensionForUpload(fileName = "", mimeType = "") {
+  const map = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "video/mp4": "mp4",
+    "video/quicktime": "mov",
+    "video/webm": "webm",
+    "video/ogg": "ogg",
+  };
+  const mapped = map[String(mimeType || "").toLowerCase()];
+  if (mapped) return mapped;
+  const fileExt = (String(fileName || "").split(".").pop() || "").trim().toLowerCase();
+  return fileExt || "jpg";
+}
+
+function parseContentDispositionFileName(value = "") {
+  const raw = String(value || "");
+  const utfMatch = raw.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+  if (utfMatch?.[1]) {
+    try {
+      return decodeURIComponent(utfMatch[1].trim());
+    } catch (_err) {}
+  }
+  const plainMatch = raw.match(/filename\s*=\s*"?([^\";]+)"?/i);
+  return plainMatch?.[1]?.trim() || "";
+}
+
+function extractGoogleDriveFileId(url = "") {
+  const raw = normalizeText(url);
+  if (!raw) return "";
+  const directMatch = raw.match(/\/file\/d\/([A-Za-z0-9_-]+)/i);
+  if (directMatch?.[1]) return directMatch[1];
+  try {
+    const parsed = new URL(raw);
+    if (!/(^|\.)drive\.google\.com$/i.test(parsed.hostname)) return "";
+    const idParam = parsed.searchParams.get("id");
+    if (idParam) return idParam;
+    const parts = String(parsed.pathname || "").split("/").filter(Boolean);
+    const marker = parts.findIndex((part) => part === "d");
+    if (marker >= 0 && parts[marker + 1]) return parts[marker + 1];
+  } catch (_err) {}
+  return "";
+}
+
+function isGoogleDriveFileUrl(url = "") {
+  return !!extractGoogleDriveFileId(url);
+}
+
+function isGoogleDriveFolderUrl(url = "") {
+  const raw = normalizeText(url);
+  if (!raw) return false;
+  try {
+    const parsed = new URL(raw);
+    return /(^|\.)drive\.google\.com$/i.test(parsed.hostname) && /\/folders\//i.test(parsed.pathname || "");
+  } catch (_err) {
+    return false;
+  }
+}
+
+function preferredRemoteMediaName(body = {}, sourceUrl = "") {
+  return normalizeText(body.updatedFileName || body.fileName || body.title || sourceUrl);
+}
+
+async function readResponsePrefix(response, maxBytes = 512) {
+  if (!response?.body?.getReader) return Buffer.alloc(0);
+  const reader = response.clone().body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value || []);
+      if (!chunk.length) continue;
+      chunks.push(chunk);
+      total += chunk.length;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return Buffer.concat(chunks, total).subarray(0, maxBytes);
+}
+
+async function describeRemoteMediaResponse(response, {
+  candidate,
+  sourceUrl,
+  rules,
+  body = {},
+  fileName: suppliedFileName = "",
+  contentType: suppliedContentType = "",
+} = {}) {
+  const dispositionName = parseContentDispositionFileName(response.headers.get("content-disposition"));
+  const fileName = suppliedFileName
+    || dispositionName
+    || preferredRemoteMediaName(body, sourceUrl);
+  const headerContentType = suppliedContentType || response.headers.get("content-type");
+  const inferredMimeType = inferRemoteMimeType(headerContentType, fileName, candidate, rules);
+  const prefix = await readResponsePrefix(response);
+  const detectedMimeType = detectRemoteMediaMimeType(prefix);
+  const mimeType = rules?.allowedMimeTypes?.has(detectedMimeType)
+    ? detectedMimeType
+    : inferredMimeType;
+  if (!mimeType) {
+    throw new Error("unsupported_remote_media_type");
+  }
+  if (
+    detectedMimeType &&
+    inferredMimeType &&
+    detectedMimeType !== inferredMimeType
+  ) {
+    throw new Error("remote_media_type_mismatch");
+  }
+  const contentLength = Number(response.headers.get("content-length") || 0) || 0;
+  if (contentLength && contentLength > rules.maxBytes) {
+    const err = new Error("remote_media_too_large");
+    err.status = 413;
+    throw err;
+  }
+  return {
+    sourceUrl: candidate,
+    finalUrl: response.url || candidate,
+    fileName,
+    mimeType,
+    fileSize: contentLength || null,
+    response,
+    extension: extensionForUpload(fileName, mimeType),
+  };
+}
+
+async function getDriveReadAccessToken() {
+  const targetPrincipal = normalizeText(process.env.DRIVE_READER_SERVICE_ACCOUNT || "");
+  let client;
+  if (targetPrincipal) {
+    const sourceClient = await runtimeCloudAuth.getClient();
+    client = new Impersonated({
+      sourceClient,
+      targetPrincipal,
+      targetScopes: [DRIVE_READ_SCOPE],
+      lifetime: 900,
+      delegates: [],
+    });
+  } else {
+    client = await directDriveReadAuth.getClient();
+  }
+  const tokenResponse = await client.getAccessToken();
+  const token = typeof tokenResponse === "string" ? tokenResponse : tokenResponse?.token;
+  if (!token) {
+    const err = new Error("drive_service_auth_unavailable");
+    err.status = 503;
+    throw err;
+  }
+  return token;
+}
+
+async function fetchAuthenticatedGoogleDriveMedia(fileId, sourceUrl, rules, body = {}) {
+  const token = await getDriveReadAccessToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const encodedId = encodeURIComponent(fileId);
+  const metadataUrl = `https://www.googleapis.com/drive/v3/files/${encodedId}?supportsAllDrives=true&fields=id,name,mimeType,size`;
+  const metadataResponse = await fetch(metadataUrl, { headers });
+  if (!metadataResponse.ok) {
+    const err = new Error(`drive_service_fetch_${metadataResponse.status}`);
+    err.status = metadataResponse.status === 404 ? 404 : 502;
+    throw err;
+  }
+  const metadata = await metadataResponse.json();
+  const mediaUrl = `https://www.googleapis.com/drive/v3/files/${encodedId}?alt=media&supportsAllDrives=true`;
+  const response = await fetch(mediaUrl, { headers, redirect: "follow" });
+  if (!response.ok) {
+    const err = new Error(`drive_service_fetch_${response.status}`);
+    err.status = response.status === 404 ? 404 : 502;
+    throw err;
+  }
+  return describeRemoteMediaResponse(response, {
+    candidate: mediaUrl,
+    sourceUrl,
+    rules,
+    body,
+    fileName: normalizeText(metadata.name),
+    contentType: normalizeText(metadata.mimeType),
+  });
+}
+
+async function fetchRemoteMediaResponse(sourceUrl, rules, body = {}) {
+  if (isGoogleDriveFolderUrl(sourceUrl)) {
+    const err = new Error("drive_folder_url_not_supported");
+    err.status = 400;
+    throw err;
+  }
+  const driveId = extractGoogleDriveFileId(sourceUrl);
+
+  let lastError = null;
+  let driveServiceError = null;
+  if (driveId) {
+    try {
+      return await fetchAuthenticatedGoogleDriveMedia(driveId, sourceUrl, rules, body);
+    } catch (err) {
+      lastError = err;
+      driveServiceError = err;
+    }
+  }
+  const candidates = driveId
+    ? [
+        `https://drive.usercontent.google.com/download?id=${encodeURIComponent(driveId)}&export=download&confirm=t`,
+        `https://drive.google.com/uc?export=download&id=${encodeURIComponent(driveId)}`,
+        sourceUrl,
+      ]
+    : [sourceUrl];
+  for (const candidate of candidates) {
+    try {
+      const response = await fetch(candidate, { redirect: "follow" });
+      if (!response.ok) {
+        lastError = new Error(`remote_fetch_${response.status}`);
+        continue;
+      }
+      return await describeRemoteMediaResponse(response, {
+        candidate,
+        sourceUrl,
+        rules,
+        body,
+      });
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  const err = driveServiceError || lastError || new Error("remote_media_fetch_failed");
+  if (!err.status) err.status = 400;
+  throw err;
+}
+
+async function streamRemoteMediaToStorage({ sourceUrl, storagePath, rules, body = {}, remoteMedia = null }) {
+  const remote = remoteMedia || await fetchRemoteMediaResponse(sourceUrl, rules, body);
+  if (!remote.response?.body) {
+    const err = new Error("missing_remote_media_stream");
+    err.status = 400;
+    throw err;
+  }
+  const bucket = storage.bucket();
+  const file = bucket.file(storagePath);
+  await new Promise((resolve, reject) => {
+    const readStream = Readable.fromWeb(remote.response.body);
+    let streamedBytes = 0;
+    readStream.on("data", (chunk) => {
+      streamedBytes += chunk.length;
+      if (streamedBytes > rules.maxBytes) {
+        readStream.destroy(new Error("remote_media_too_large"));
+      }
+    });
+    const writeStream = file.createWriteStream({
+      metadata: {
+        contentType: remote.mimeType,
+        cacheControl: "public,max-age=3600",
+      },
+      resumable: false,
+    });
+    readStream.on("error", reject);
+    writeStream.on("error", reject);
+    writeStream.on("finish", resolve);
+    readStream.pipe(writeStream);
+  });
+  const publicUrl = await getDownloadURL(file);
+  return {
+    ...remote,
+    publicUrl,
+    storagePath,
+    fileSize: remote.fileSize,
+  };
+}
+
+function parseBase64Upload(body, rules) {
+  const mimeType = normalizeText(body?.mimeType).toLowerCase();
+  const base64Data = normalizeText(body?.base64Data);
+  const fileName = normalizeText(body?.fileName);
+  const width = Number(body?.width || 0) || null;
+  const height = Number(body?.height || 0) || null;
+  const claimedFileSize = Number(body?.fileSize || 0) || null;
+
+  if (!mimeType || !base64Data) {
+    const err = new Error("missing_upload_payload");
+    err.status = 400;
+    throw err;
+  }
+  if (!rules.allowedMimeTypes.has(mimeType)) {
+    const err = new Error("invalid_mime_type");
+    err.status = 400;
+    throw err;
+  }
+  if (!/^[a-z0-9+/]+=*$/i.test(base64Data)) {
+    const err = new Error("invalid_base64_payload");
+    err.status = 400;
+    throw err;
+  }
+
+  let buffer;
+  try {
+    buffer = Buffer.from(base64Data, "base64");
+  } catch {
+    const err = new Error("invalid_base64_payload");
+    err.status = 400;
+    throw err;
+  }
+  if (!buffer.length) {
+    const err = new Error("empty_upload");
+    err.status = 400;
+    throw err;
+  }
+  if (buffer.length > rules.maxBytes) {
+    const err = new Error("file_too_large");
+    err.status = 413;
+    throw err;
+  }
+  if (claimedFileSize && Math.abs(claimedFileSize - buffer.length) > 16) {
+    const err = new Error("file_size_mismatch");
+    err.status = 400;
+    throw err;
+  }
+
+  const detectedMimeType = detectImageMimeType(buffer);
+  if (!detectedMimeType || detectedMimeType !== mimeType) {
+    const err = new Error("file_type_mismatch");
+    err.status = 400;
+    throw err;
+  }
+
+  return {
+    mimeType,
+    fileName,
+    width,
+    height,
+    fileSize: buffer.length,
+    buffer,
+    extension: extensionForUpload(fileName, mimeType),
+  };
+}
+
+async function saveImageUpload({ storagePath, mimeType, buffer, cacheControl = "public,max-age=3600" }) {
+  const bucket = storage.bucket();
+  const file = bucket.file(storagePath);
+  await file.save(buffer, {
+    metadata: {
+      contentType: mimeType,
+      cacheControl,
+    },
+    resumable: false,
+  });
+  const publicUrl = await getDownloadURL(file);
+  return { file, publicUrl };
+}
+
+function buildFlagHistoryEntry(eventType, actor, note = "", extra = {}) {
+  return {
+    eventType,
+    actorUid: actor?.uid || "",
+    actorEmail: actor?.email || "",
+    note: normalizeText(note || ""),
+    createdAtIso: new Date().toISOString(),
+    ...extra,
+  };
+}
+
+function buildDuplicateHistoryEntry(eventType, actor, note = "", extra = {}) {
+  return {
+    eventType,
+    actorUid: actor?.uid || "",
+    actorEmail: actor?.email || "",
+    note: normalizeText(note || ""),
+    createdAtIso: new Date().toISOString(),
+    ...extra,
+  };
+}
+
+function mapContentDuplicateDoc(doc) {
+  const data = doc.data() || {};
+  return {
+    id: doc.id,
+    imageId: data.imageId || "",
+    title: data.title || "",
+    author: data.author || "",
+    imageType: data.imageType || "",
+    releaseCatalog: data.releaseCatalog || "",
+    currentImageUrl: data.currentImageUrl || "",
+    driveLink: data.driveLink || "",
+    duplicateOfImageId: data.duplicateOfImageId || "",
+    duplicateOfTitle: data.duplicateOfTitle || "",
+    duplicateOfAuthor: data.duplicateOfAuthor || "",
+    duplicateOfBook: data.duplicateOfBook || "",
+    duplicateOfDriveLink: data.duplicateOfDriveLink || "",
+    duplicateMatchType: data.duplicateMatchType || "",
+    duplicateFingerprint: data.duplicateFingerprint || "",
+    sourceCompletionId: data.sourceCompletionId || "",
+    sourceRequestId: data.sourceRequestId || "",
+    sourceTool: data.sourceTool || "",
+    status: data.status || "pending",
+    detectedByUid: data.detectedByUid || "",
+    detectedByEmail: data.detectedByEmail || "",
+    createdAt: data.createdAt || null,
+    reviewedAt: data.reviewedAt || null,
+    reviewedBy: data.reviewedBy || "",
+    reviewDecision: data.reviewDecision || "",
+    reviewNote: data.reviewNote || "",
+    moderationHistory: Array.isArray(data.moderationHistory) ? data.moderationHistory : [],
+  };
+}
+
+function mapSubmissionDoc(doc) {
+  const data = doc.data() || {};
+  return {
+    id: doc.id,
+    submissionType: data.submissionType || "",
+    title: data.title || "",
+    text: data.text || "",
+    note: data.note || "",
+    imageUrl: data.imageUrl || "",
+    imageWidth: Number(data.imageWidth || 0) || 0,
+    imageHeight: Number(data.imageHeight || 0) || 0,
+    mimeType: data.mimeType || "",
+    fileSize: Number(data.fileSize || 0) || 0,
+    releaseCatalog: data.releaseCatalog || USER_SUBMISSION_CATALOG,
+    status: data.status || "pending",
+    reviewNote: data.reviewNote || "",
+    submitterUid: data.submitterUid || "",
+    submitterEmail: data.submitterEmail || "",
+    submitterDisplayName: data.submitterDisplayName || "",
+    likeCount: Number(data.likeCount || 0) || 0,
+    movedMeCount: Number(data.movedMeCount || 0) || 0,
+    mehCount: Number(data.mehCount || 0) || 0,
+    dislikeCount: Number(data.dislikeCount || 0) || 0,
+    positiveResponseCount: Number(data.positiveResponseCount || 0) || 0,
+    lastSeenPositiveResponseCount: Number(data.lastSeenPositiveResponseCount || 0) || 0,
+    createdAt: data.createdAt || null,
+    reviewedAt: data.reviewedAt || null,
+  };
+}
+
+function readMiscValue(misc = "", key = "") {
+  const target = normalizeKey(key);
+  if (!target) return "";
+  return normalizeText(misc)
+    .split("|")
+    .map((part) => part.trim())
+    .find((part) => normalizeKey(part).startsWith(`${target}=`))
+    ?.split("=")
+    .slice(1)
+    .join("=")
+    .trim() || "";
+}
+
+function classifyExcQualityLane(item = {}) {
+  const type = normalizeText(item.imageType).toUpperCase();
+  if (type !== "EXC") return "";
+  const excerpt = normalizeText(item.excerpt);
+  const title = normalizeText(item.poem || item.title);
+  if (!normalizeText(item.releaseCatalog)) return "missing_catalog";
+  if (!title) return "missing_poem_title";
+  if (excerpt.includes("...")) return "photo_instruction_ellipsis";
+  if (excerpt.length > 280) return "too_long";
+  return "";
+}
+
+function buildGraphicDuplicateKeys(item = {}) {
+  const keys = [];
+  const sourceCompletionId = normalizeKey(
+    item.sourceCompletionId
+    || readMiscValue(item.misc, "weaverSourceCompletionId")
+    || readMiscValue(item.misc, "weaverPigCompletionId")
+  );
+  if (sourceCompletionId) {
+    keys.push({ type: "sourceCompletionId", value: `sourceCompletionId:${sourceCompletionId}` });
+  }
+
+  const driveLink = normalizeText(item.driveLink);
+  const driveLinkKey = normalizeKey(extractGoogleDriveFileId(driveLink) || driveLink);
+  if (driveLinkKey) {
+    keys.push({ type: "driveLink", value: `driveLink:${driveLinkKey}` });
+  }
+
+  const previewUrl = normalizeText(item.imageUrl);
+  const previewKey = normalizeKey(extractGoogleDriveFileId(previewUrl) || previewUrl);
+  if (previewKey && previewKey !== driveLinkKey) {
+    keys.push({ type: "imageUrl", value: `imageUrl:${previewKey}` });
+  }
+
+  const seen = new Set();
+  return keys.filter((entry) => {
+    if (!entry?.value || seen.has(entry.value)) return false;
+    seen.add(entry.value);
+    return true;
+  });
+}
+
+async function createContentDuplicateForItem(item, primary, actor, extra = {}) {
+  const existingSnap = await db.collection(COLLECTIONS.contentDuplicates)
+    .where("imageId", "==", item.imageId)
+    .limit(25)
+    .get();
+  const existingPending = existingSnap.docs
+    .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
+    .find((row) => row.status === "pending");
+  if (existingPending) {
+    return { ok: false, reason: "already_captured", duplicate: existingPending };
+  }
+
+  const duplicateRef = db.collection(COLLECTIONS.contentDuplicates).doc();
+  await duplicateRef.set({
+    imageId: item.imageId,
+    title: item.title || "",
+    author: item.author || "",
+    imageType: item.imageType || "",
+    releaseCatalog: item.releaseCatalog || "",
+    qualityLane: extra.qualityLane || classifyExcQualityLane(item),
+    currentImageUrl: item.imageUrl || "",
+    driveLink: item.driveLink || "",
+    duplicateOfImageId: primary?.imageId || "",
+    duplicateOfTitle: primary?.title || "",
+    duplicateOfAuthor: primary?.author || "",
+    duplicateOfBook: primary?.book || "",
+    duplicateOfDriveLink: primary?.driveLink || "",
+    duplicateMatchType: extra.duplicateMatchType || "",
+    duplicateFingerprint: extra.duplicateFingerprint || "",
+    sourceCompletionId: item.sourceCompletionId || "",
+    sourceRequestId: item.sourceRequestId || "",
+    sourceTool: item.sourceTool || "",
+    status: "pending",
+    detectedByUid: actor?.uid || "",
+    detectedByEmail: actor?.email || "",
+    createdAt: FieldValue.serverTimestamp(),
+    moderationHistory: [
+      buildDuplicateHistoryEntry("duplicate_detected", actor, extra.note || "Captured during Weaver -> Poetry Please import.", {
+        duplicateMatchType: extra.duplicateMatchType || "",
+        duplicateFingerprint: extra.duplicateFingerprint || "",
+        source: extra.source || "weaver_import",
+        primaryImageId: primary?.imageId || "",
+      }),
+    ],
+  });
+
+  return { ok: true, duplicateId: duplicateRef.id };
+}
+
+async function createContentFlagForItem(item, ctx, note, extra = {}) {
+  const existingSnap = await db.collection(COLLECTIONS.contentFlags)
+    .where("imageId", "==", item.imageId)
+    .limit(25)
+    .get();
+  const existingPending = existingSnap.docs
+    .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
+    .find((flag) => flag.status === "pending");
+  if (existingPending) {
+    return { ok: false, reason: "already_flagged", flag: existingPending };
+  }
+
+  const flagRef = db.collection(COLLECTIONS.contentFlags).doc();
+  await flagRef.set({
+    imageId: item.imageId,
+    title: item.title || "",
+    author: item.author || "",
+    imageType: item.imageType || "",
+    releaseCatalog: item.releaseCatalog || "",
+    currentImageUrl: item.imageUrl || "",
+    flaggedByUid: ctx.decoded.uid,
+    flaggedByEmail: ctx.decoded.email,
+    flaggedByRoles: Array.isArray(ctx.userRecord?.roles) ? ctx.userRecord.roles : [],
+    note,
+    status: "pending",
+    createdAt: FieldValue.serverTimestamp(),
+    moderationHistory: [
+      buildFlagHistoryEntry("flagged", { uid: ctx.decoded.uid, email: ctx.decoded.email }, note, {
+        roles: Array.isArray(ctx.userRecord?.roles) ? ctx.userRecord.roles : [],
+        ...extra,
+      }),
+    ],
+  });
+
+  return { ok: true, flagId: flagRef.id };
 }
 
 async function getVotesByUser(userId) {
@@ -95,41 +1116,2097 @@ async function getVotesByUser(userId) {
   return list;
 }
 
+async function getUniqueVotedImageIdsByUser(userId) {
+  const ids = new Set();
+  let page = await db.collection(COLLECTIONS.votes).where("userId", "==", userId).select("imageId").limit(1000).get();
+  while (!page.empty) {
+    page.forEach((d) => {
+      const f = d.data() || {};
+      const imageId = normalizeText(f.imageId || "").toLowerCase();
+      if (imageId) ids.add(imageId);
+    });
+    const last = page.docs[page.docs.length - 1];
+    page = await db
+      .collection(COLLECTIONS.votes)
+      .where("userId", "==", userId)
+      .select("imageId")
+      .startAfter(last)
+      .limit(1000)
+      .get();
+  }
+  return ids;
+}
+
+async function getVoteDocsByUser(userId) {
+  const list = [];
+  let page = await db.collection(COLLECTIONS.votes).where("userId", "==", userId).limit(1000).get();
+  while (!page.empty) {
+    page.forEach((d) => {
+      const f = d.data() || {};
+      list.push({
+        ref: d.ref,
+        id: d.id,
+        imageId: f.imageId || "",
+        voteType: (f.voteType || "").toLowerCase(),
+        userId: f.userId || "",
+        timestamp: f.timestamp || null,
+      });
+    });
+    const last = page.docs[page.docs.length - 1];
+    page = await db
+      .collection(COLLECTIONS.votes)
+      .where("userId", "==", userId)
+      .startAfter(last)
+      .limit(1000)
+      .get();
+  }
+  return list;
+}
+
+async function getAllVotes() {
+  const list = [];
+  let page = await db.collection(COLLECTIONS.votes).limit(1000).get();
+  while (!page.empty) {
+    page.forEach((doc) => {
+      const data = doc.data() || {};
+      list.push({
+        id: doc.id,
+        imageId: data.imageId || "",
+        voteType: (data.voteType || "").toLowerCase(),
+        userId: data.userId || "",
+        timestamp: data.timestamp || null,
+      });
+    });
+    const last = page.docs[page.docs.length - 1];
+    page = await db.collection(COLLECTIONS.votes).startAfter(last).limit(1000).get();
+  }
+  return list;
+}
+
+async function getAuthorVoteUserIds() {
+  const ids = new Set();
+  let page = await db.collection(COLLECTIONS.users).limit(1000).get();
+  while (!page.empty) {
+    page.forEach((doc) => {
+      const data = doc.data() || {};
+      const roles = Array.isArray(data.roles) ? data.roles.map(normalizeKey) : [];
+      if (!roles.includes("author")) return;
+      ids.add(normalizeKey(doc.id));
+      if (data.email) ids.add(normalizeKey(data.email));
+    });
+    const last = page.docs[page.docs.length - 1];
+    page = await db.collection(COLLECTIONS.users).startAfter(last).limit(1000).get();
+  }
+  return ids;
+}
+
+async function getAuthorVoteIdentities() {
+  const identities = new Map();
+  const [userSnap, profileSnap] = await Promise.all([
+    db.collection(COLLECTIONS.users).limit(1000).get(),
+    db.collection(COLLECTIONS.authorProfiles).limit(1000).get(),
+  ]);
+  const profiles = new Map(profileSnap.docs.map((doc) => [doc.id, { id: doc.id, ...(doc.data() || {}) }]));
+  const addIdentity = (userKey, profile) => {
+    const key = normalizeKey(userKey);
+    if (!key || !profile) return;
+    const names = uniq([
+      profile.displayName,
+      profile.name,
+      ...(Array.isArray(profile.authorNameVariants) ? profile.authorNameVariants : []),
+    ].map(normalizeKey).filter(Boolean));
+    if (names.length) identities.set(key, new Set(names));
+  };
+  userSnap.docs.forEach((doc) => {
+    const data = doc.data() || {};
+    const profile = profiles.get(data.authorProfileId) || Array.from(profiles.values()).find((item) => item.userId === doc.id);
+    addIdentity(doc.id, profile);
+    addIdentity(data.email, profile);
+  });
+  return identities;
+}
+
+function timestampToMs(value) {
+  if (!value) return 0;
+  if (typeof value?.toMillis === "function") return value.toMillis();
+  if (typeof value?._seconds === "number") return (value._seconds * 1000) + Math.floor((value._nanoseconds || 0) / 1e6);
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeTimestamp(value) {
+  const timestamp = timestampToMs(value);
+  return timestamp ? new Date(timestamp) : null;
+}
+
 function mapToArr(o) {
+  const mediaUrl = (o.imageType || "") === "YT"
+    ? (o.youtubeUrl || o.url || o.imageUrl || "")
+    : (o.imageUrl || o.videoUrl || o.url || "");
   return [
     o.author || "",
     o.title || "",
     o.book || "",
     o.imageId || "",
-    o.imageUrl || "",
+    mediaUrl,
     o.bookLink || "",
     o.releaseCatalog || "",
     o.imageType || "",
     o.excerpt || "",
+    o.youtubeId || "",
+    o.uploadTime || "",
+    Number(o.socialViews || 0) || 0,
+    Number(o.socialLikes || 0) || 0,
+    Number(o.socialComments || 0) || 0,
+    Number(o.socialDislikes || 0) || 0,
+    o.sourceEvent || "",
+    o.sourceEventLabel || "",
   ];
 }
 
-function aggregateRatings(voteDocs) {
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderScoreboardTextPreviewPage(item) {
+  const title = normalizeText(item.title || item.poem || "Untitled");
+  const author = normalizeText(item.author);
+  const book = normalizeText(item.book || item.bookTitle);
+  const type = normalizeText(item.imageType || item.type).toUpperCase();
+  const typeLabel = type === "FP" ? "Full poem" : type === "EXC" ? "Excerpt" : type || "Text";
+  const text = normalizeText(item.excerpt || item.text || "");
+  const sourceUrl = normalizeText(item.bookLink || item.driveLink || item.url || "");
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(title)} - Poetry Please</title>
+  <style>
+    :root { color-scheme: light; --bg:#fffdf8; --ink:#231f1a; --muted:#71685c; --line:#e6dccb; --accent:#2f5d62; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font-family: ui-serif, Georgia, "Times New Roman", serif; }
+    main { max-width: 760px; margin: 0 auto; padding: 34px 30px 42px; }
+    .eyebrow { margin: 0 0 12px; color: var(--accent); font: 700 12px/1.2 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(30px, 5vw, 48px); line-height: 1.04; font-weight: 700; }
+    .meta { margin-top: 12px; color: var(--muted); font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .text { margin-top: 30px; border-top: 1px solid var(--line); padding-top: 26px; white-space: pre-wrap; font-size: 21px; line-height: 1.62; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">${escapeHtml(typeLabel)}</p>
+    <h1>${escapeHtml(title)}</h1>
+    <div class="meta">
+      ${author ? `<div>${escapeHtml(author)}</div>` : ""}
+      ${book ? `<div>${escapeHtml(book)}</div>` : ""}
+      ${sourceUrl ? `<div><a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">Open source</a></div>` : ""}
+    </div>
+    <div class="text">${escapeHtml(text)}</div>
+  </main>
+</body>
+</html>`;
+}
+
+function mapToCounterArr(o) {
+  return [
+    o.author || "",
+    "",
+    o.book || "",
+    o.imageId || "",
+    "",
+    "",
+    o.releaseCatalog || "",
+    o.imageType || "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    o.sourceEvent || "",
+    o.sourceEventLabel || "",
+  ];
+}
+
+function authorVoteWeight(voteType) {
+  const t = normalizeKey(voteType);
+  if (t === "dislike") return -100;
+  if (t === "like") return 10;
+  if (t === "movedme" || t === "moved_me") return 25;
+  return 0;
+}
+
+function aggregateRatings(voteDocs, options = {}) {
+  const authorVoteUserIds = options.authorVoteUserIds || new Set();
   const agg = {};
   for (const v of voteDocs) {
     const id = (v.imageId || "").trim();
     if (!id) continue;
     const t = (v.voteType || "").toLowerCase();
+    const isAuthorVote = authorVoteUserIds.has(normalizeKey(v.userId || v.user || ""));
     let w = 0;
-    if (t === "dislike") w = -1;
+    if (isAuthorVote) w = authorVoteWeight(t);
+    else if (t === "dislike") w = -1;
     else if (t === "meh") w = 0;
     else if (t === "like") w = 1;
     else if (t === "moved me" || t === "movedme" || t === "moved_me") w = 2;
-    if (!agg[id]) agg[id] = { score: 0, total: 0 };
+    if (!agg[id]) agg[id] = { score: 0, total: 0, likes: 0, dislikes: 0, meh: 0, movedMe: 0, authorLikes: 0, authorDislikes: 0, authorMovedMe: 0 };
     agg[id].score += w;
     agg[id].total += 1;
+    if (t === "like") agg[id].likes += 1;
+    else if (t === "dislike") agg[id].dislikes += 1;
+    else if (t === "meh") agg[id].meh += 1;
+    else if (t === "moved me" || t === "movedme" || t === "moved_me") agg[id].movedMe += 1;
+    if (isAuthorVote) {
+      if (t === "like") agg[id].authorLikes += 1;
+      else if (t === "dislike") agg[id].authorDislikes += 1;
+      else if (t === "moved me" || t === "movedme" || t === "moved_me") agg[id].authorMovedMe += 1;
+    }
   }
   const out = {};
   Object.keys(agg).forEach((id) => {
-    const { score, total } = agg[id];
-    out[id] = { score, total, rating: total ? score / total : 0 };
+    const { score, total, likes, dislikes, meh, movedMe, authorLikes, authorDislikes, authorMovedMe } = agg[id];
+    out[id] = { score, total, rating: total ? score / total : 0, likes, dislikes, meh, movedMe, authorLikes, authorDislikes, authorMovedMe, authorExcluded: authorDislikes > 0 };
   });
   return out;
+}
+
+async function getRatingsSummaryCached() {
+  const now = Date.now();
+  if (ratingsCache.payload && (now - ratingsCache.builtAt) < RATINGS_CACHE_TTL_MS) {
+    return ratingsCache.payload;
+  }
+  if (ratingsCache.inFlight) return ratingsCache.inFlight;
+  ratingsCache.inFlight = Promise.all([getAllVotes(), getAuthorVoteUserIds()])
+    .then(([votes, authorVoteUserIds]) => aggregateRatings(votes.map((vote) => ({ imageId: vote.imageId, voteType: vote.voteType, userId: vote.userId })), { authorVoteUserIds }))
+    .then((payload) => {
+      ratingsCache.payload = payload;
+      ratingsCache.builtAt = Date.now();
+      ratingsCache.inFlight = null;
+      return payload;
+    })
+    .catch((err) => {
+      ratingsCache.inFlight = null;
+      throw err;
+    });
+  return ratingsCache.inFlight;
+}
+
+function buildFeedPayload({ all, votedIds, limit, includeDomainMeta = false, ratingsSummary = null }) {
+  const newObjs = all.filter((o) => !votedIds.has((o.imageId || "").trim().toLowerCase()));
+  const batch = sampleItems(newObjs, limit);
+  const releaseCatalogs = uniqueReleaseCatalogs(all);
+  const imageTypes = [...new Set(all.map((o) => o.imageType).filter(Boolean))].sort();
+  const sourceEvents = [...new Set(all.map((o) => o.sourceEventLabel || o.sourceEvent).filter(Boolean))].sort();
+
+  return {
+    allGraphics: includeDomainMeta ? all.map(mapToCounterArr) : [],
+    newGraphics: batch.map(mapToArr),
+    totalImages: all.length,
+    votedImagesCount: votedIds.size,
+    remainingImagesCount: newObjs.length,
+    releaseCatalogs,
+    imageTypes,
+    sourceEvents,
+    ...(ratingsSummary ? { ratingsSummary } : {}),
+  };
+}
+
+function matchesFilterValue(actual, expected) {
+  if (!normalizeText(expected)) return true;
+  return normalizeKey(actual) === normalizeKey(expected);
+}
+
+function normalizeCatalogFilterValue(value = "") {
+  const text = normalizeText(value);
+  return normalizeKey(text) === "shortformcontest" ? "Contest" : text;
+}
+
+function uniqueReleaseCatalogs(items = []) {
+  return [...new Set(items.map((item) => normalizeCatalogFilterValue(item.releaseCatalog)).filter(Boolean))].sort();
+}
+
+function matchesCatalogFilterValue(actual, expected) {
+  if (!normalizeText(expected)) return true;
+  return normalizeKey(normalizeCatalogFilterValue(actual)) === normalizeKey(normalizeCatalogFilterValue(expected));
+}
+
+function matchesRequestedType(item, requestedType) {
+  const type = normalizeText(requestedType).toUpperCase();
+  if (!type) return true;
+  const actual = normalizeText(item?.imageType).toUpperCase();
+  if (type === "VIDEO") return actual === "VV" || actual === "YT";
+  return actual === type;
+}
+
+function filterContentByFeedFilters(items, filters = {}) {
+  return (items || []).filter((item) => {
+    if (!matchesRequestedType(item, filters.type)) return false;
+    if (!matchesCatalogFilterValue(item?.releaseCatalog, filters.catalog)) return false;
+    if (!matchesFilterValue(item?.author, filters.author)) return false;
+    if (!matchesFilterValue(item?.book, filters.book)) return false;
+    if (!matchesFilterValue(item?.sourceEvent, filters.event) && !matchesFilterValue(item?.sourceEventLabel, filters.event)) return false;
+    return true;
+  });
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    const normalized = normalizeText(value);
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function firstArray(...values) {
+  for (const value of values) {
+    if (Array.isArray(value) && value.length) return value;
+  }
+  return [];
+}
+
+function normalizeWeaverGraphicsPayload(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+  return firstArray(
+    payload.items,
+    payload.records,
+    payload.results,
+    payload.requests,
+    payload.data,
+    payload.graphics,
+    payload.completedGraphics
+  );
+}
+
+function flattenWeaverGraphicsRecords(payload) {
+  return normalizeWeaverGraphicsPayload(payload)
+    .filter((record) => record && typeof record === "object")
+    .map((record, parentIndex) => ({
+      ...record,
+      __weaverParentRecord: record,
+      __weaverExcerpts: firstArray(
+        record.excerpts,
+        record.groupedExcerpts,
+        record.requestExcerpts,
+        record.lines
+      ),
+      __weaverParentIndex: parentIndex,
+      __weaverAssetIndex: 0,
+    }));
+}
+
+function deriveWeaverGraphicsDocId(record, defaultImageType = "QI") {
+  const parent = record?.__weaverParentRecord || {};
+  const normalizedType = normalizeText(record?.contentType || record?.imageType || defaultImageType).toUpperCase();
+  const explicit = sanitizeDocIdSegment(firstNonEmpty(
+    record.docId,
+    record.imageId,
+    record.contentId,
+    normalizedType === "FPI" ? record.sourceRecordId : "",
+    record.sourceCompletionId,
+    record.graphicId,
+    record.completedGraphicId,
+    record.assetId,
+    record.outputId,
+    record.resultId
+  ));
+  if (explicit) return explicit;
+
+  const requestId = sanitizeDocIdSegment(firstNonEmpty(
+    record.graphicsRequestId,
+    record.requestId,
+    parent.graphicsRequestId,
+    parent.requestId
+  ));
+  const excerptId = sanitizeDocIdSegment(firstNonEmpty(
+    record.excerptId,
+    record.sourceExcerptId,
+    record.__weaverExcerpts?.[0]?.excerptId,
+    record.__weaverExcerpts?.[0]?.sourceExcerptId
+  ));
+  if (requestId && excerptId) return `${requestId}-${excerptId}`.toUpperCase();
+
+  const bookShortener = sanitizeDocIdSegment(firstNonEmpty(
+    record.bookShortener,
+    parent.bookShortener,
+    record.bookCode,
+    parent.bookCode
+  ));
+  const title = firstNonEmpty(
+    record.title,
+    record.poemTitle,
+    record.poem,
+    record.excerptTitle,
+    record.displayTitle,
+    record.__weaverExcerpts?.[0]?.title,
+    record.__weaverExcerpts?.[0]?.poemTitle,
+    record.__weaverExcerpts?.[0]?.poem
+  );
+  if (bookShortener && title) {
+    return `${bookShortener}-${defaultImageType}-${slugify(title)}`.toUpperCase();
+  }
+  if (requestId) {
+    return `${requestId}-${String((record.__weaverAssetIndex || 0) + 1).padStart(2, "0")}`.toUpperCase();
+  }
+  return "";
+}
+
+function mapWeaverGraphicRecord(record, options = {}) {
+  const defaultImageType = normalizeText(options.defaultImageType || "QI").toUpperCase();
+  const parent = record?.__weaverParentRecord || {};
+  const firstExcerpt = (record?.__weaverExcerpts || []).find((entry) => entry && typeof entry === "object") || {};
+  const author = canonicalizeAuthorName(firstNonEmpty(record.author, parent.author, firstExcerpt.author));
+  const book = firstNonEmpty(record.book, parent.book, firstExcerpt.book);
+  const catalogBookMetadata = lookupCatalogBookMetadata(book, author);
+  const bookShortener = sanitizeDocIdSegment(firstNonEmpty(
+    record.bookShortener,
+    parent.bookShortener,
+    firstExcerpt.bookShortener,
+    record.bookCode,
+    parent.bookCode,
+    catalogBookMetadata?.bookShortener
+  ));
+  const docId = deriveWeaverGraphicsDocId(record, defaultImageType);
+  const assetLinkUrl = firstNonEmpty(
+    record.assetLinkUrl,
+    record.assetUrl,
+    record.driveLink,
+    record.sourceDriveLink,
+    record.assetDriveLink,
+    record.publicUrl,
+    record.storageUrl,
+    record.outputUrl,
+    record.url,
+    record.finalUrl,
+    record.hostedUrl
+  );
+  const imageUrl = firstNonEmpty(
+    record.previewUrl,
+    record.assetPreviewUrl,
+    record.imageUrl,
+    assetLinkUrl
+  );
+
+  const excerptText = firstNonEmpty(
+    record.quoteText,
+    record.excerpt,
+    record.excerptText,
+    firstExcerpt.excerpt,
+    firstExcerpt.excerptText
+  );
+
+  const miscParts = [
+    firstNonEmpty(record.graphicsRequestId, parent.graphicsRequestId) && `weaverGraphicsRequestId=${firstNonEmpty(record.graphicsRequestId, parent.graphicsRequestId)}`,
+    firstNonEmpty(record.pigCompletionId, parent.pigCompletionId) && `weaverPigCompletionId=${firstNonEmpty(record.pigCompletionId, parent.pigCompletionId)}`,
+    firstNonEmpty(record.sourceRequestId, parent.sourceRequestId) && `weaverSourceRequestId=${firstNonEmpty(record.sourceRequestId, parent.sourceRequestId)}`,
+    firstNonEmpty(record.sourceCompletionId, parent.sourceCompletionId) && `weaverSourceCompletionId=${firstNonEmpty(record.sourceCompletionId, parent.sourceCompletionId)}`,
+    firstNonEmpty(record.storageTarget, parent.storageTarget) && `weaverStorageTarget=${firstNonEmpty(record.storageTarget, parent.storageTarget)}`,
+    firstNonEmpty(record.graphicsQcDecision, parent.graphicsQcDecision) && `weaverQcDecision=${firstNonEmpty(record.graphicsQcDecision, parent.graphicsQcDecision)}`,
+    firstNonEmpty(record.graphicsQcUpdatedAt, parent.graphicsQcUpdatedAt) && `weaverQcUpdatedAt=${firstNonEmpty(record.graphicsQcUpdatedAt, parent.graphicsQcUpdatedAt)}`,
+    firstNonEmpty(record.qcApprovedAt, parent.qcApprovedAt) && `weaverQcApprovedAt=${firstNonEmpty(record.qcApprovedAt, parent.qcApprovedAt)}`,
+    firstNonEmpty(record.graphicsQcNote, parent.graphicsQcNote) && `weaverQcNote=${firstNonEmpty(record.graphicsQcNote, parent.graphicsQcNote)}`,
+    firstNonEmpty(record.qcNote, parent.qcNote) && `weaverQcNote=${firstNonEmpty(record.qcNote, parent.qcNote)}`,
+    firstNonEmpty(record.productionNotes, parent.productionNotes) && `weaverProductionNotes=${firstNonEmpty(record.productionNotes, parent.productionNotes)}`,
+    firstNonEmpty(record.sourceTool, parent.sourceTool) && `weaverSourceTool=${firstNonEmpty(record.sourceTool, parent.sourceTool)}`,
+    firstNonEmpty(record.requestStatus, parent.requestStatus) && `weaverRequestStatus=${firstNonEmpty(record.requestStatus, parent.requestStatus)}`,
+    firstNonEmpty(record.completedAt, parent.completedAt) && `weaverCompletedAt=${firstNonEmpty(record.completedAt, parent.completedAt)}`,
+    firstNonEmpty(record.sourceExcerptId, firstExcerpt.excerptId, firstExcerpt.sourceExcerptId) && `weaverExcerptId=${firstNonEmpty(record.sourceExcerptId, firstExcerpt.excerptId, firstExcerpt.sourceExcerptId)}`,
+    excerptText && `sourceExcerpt=${excerptText.slice(0, 280)}`,
+  ].filter(Boolean).join(" | ");
+
+  return {
+    docId,
+    contentId: docId,
+    imageId: docId,
+    imageType: defaultImageType,
+    sourceCompletionId: firstNonEmpty(record.sourceCompletionId, parent.sourceCompletionId, record.pigCompletionId, parent.pigCompletionId),
+    sourceRequestId: firstNonEmpty(record.sourceRequestId, parent.sourceRequestId, record.graphicsRequestId, parent.graphicsRequestId),
+    sourceTool: firstNonEmpty(record.sourceTool, parent.sourceTool),
+    sourceRecordId: firstNonEmpty(record.sourceRecordId, parent.sourceRecordId, record.id, parent.id),
+    sourceSystem: firstNonEmpty(record.sourceSystem, parent.sourceSystem, "weaver"),
+    bookShortener: sanitizeDocIdSegment(firstNonEmpty(
+      record.bookShortener,
+      parent.bookShortener,
+      firstExcerpt.bookShortener,
+      record.bookCode,
+      parent.bookCode,
+      catalogBookMetadata?.bookShortener
+    )),
+    author,
+    book,
+    title: firstNonEmpty(
+      record.poemTitle,
+      record.title,
+      record.poemTitle,
+      record.poem,
+      record.displayTitle,
+      parent.title,
+      parent.poemTitle,
+      firstExcerpt.title,
+      firstExcerpt.poemTitle,
+      firstExcerpt.poem
+    ),
+    imageUrl,
+    driveLink: firstNonEmpty(
+      record.assetLinkUrl,
+      record.driveLink,
+      record.sourceDriveLink,
+      record.assetDriveLink,
+      parent.driveLink,
+      parent.sourceDriveLink
+    ),
+    bookLink: firstNonEmpty(
+      record.bookLink,
+      parent.bookLink,
+      firstExcerpt.bookLink,
+      catalogBookMetadata?.bookLink
+    ),
+    releaseCatalog: firstNonEmpty(
+      record.releaseCatalog,
+      parent.releaseCatalog,
+      firstExcerpt.releaseCatalog,
+      catalogBookMetadata?.releaseCatalog
+    ),
+    sourceEvent: firstNonEmpty(record.sourceEvent, parent.sourceEvent, firstExcerpt.sourceEvent),
+    sourceEventLabel: firstNonEmpty(record.sourceEventLabel, parent.sourceEventLabel, firstExcerpt.sourceEventLabel),
+    pageNumber: firstNonEmpty(record.pageNumber, parent.pageNumber, firstExcerpt.pageNumber),
+    ocrText: firstNonEmpty(record.ocrText, record.extractedText, record.transcription, parent.ocrText),
+    reviewStatus: firstNonEmpty(record.reviewStatus, parent.reviewStatus, defaultImageType === "FPI" ? "needs_ocr" : ""),
+    misc: miscParts,
+  };
+}
+
+function shouldImportWeaverGraphicRecord(record, options = {}) {
+  const defaultImageType = normalizeText(options.defaultImageType || "QI").toUpperCase();
+  const isFullPoemImage = defaultImageType === "FPI";
+  if (isFullPoemImage && firstNonEmpty(record?.driveLink, record?.assetLinkUrl, record?.assetUrl, record?.publicUrl, record?.storageUrl, record?.imageUrl, record?.url)) {
+    return true;
+  }
+  if (firstNonEmpty(record?.sourceCompletionId, record?.__weaverParentRecord?.sourceCompletionId)) {
+    return !!firstNonEmpty(record?.driveLink, record?.assetLinkUrl, record?.assetUrl, record?.publicUrl, record?.storageUrl);
+  }
+  const storageTarget = normalizeKey(firstNonEmpty(record?.storageTarget, record?.__weaverParentRecord?.storageTarget));
+  const qcDecision = normalizeKey(firstNonEmpty(record?.graphicsQcDecision, record?.__weaverParentRecord?.graphicsQcDecision));
+  const assetLinkUrl = firstNonEmpty(record?.assetLinkUrl, record?.assetUrl, record?.publicUrl, record?.storageUrl);
+  return storageTarget === "pig_sheet" && qcDecision === "approve" && !!assetLinkUrl;
+}
+
+async function buildWeaverGraphicsDuplicatePlan(mappedItems = []) {
+  const existingGraphics = await getAllFrom(COLLECTIONS.graphics);
+  const existingByDuplicateKey = new Map();
+
+  existingGraphics.forEach((item) => {
+    buildGraphicDuplicateKeys(item).forEach((entry) => {
+      if (!existingByDuplicateKey.has(entry.value)) {
+        existingByDuplicateKey.set(entry.value, {
+          imageId: item.imageId || item.id || "",
+          imageType: item.imageType || "",
+          title: item.title || "",
+          author: item.author || "",
+          book: item.book || "",
+          imageUrl: item.imageUrl || "",
+          driveLink: item.driveLink || "",
+          duplicateMatchType: entry.type,
+        });
+      }
+    });
+  });
+
+  const acceptedItems = [];
+  const duplicateItems = [];
+  const acceptedByDuplicateKey = new Map();
+
+  mappedItems.forEach((item) => {
+    const duplicateKeys = buildGraphicDuplicateKeys(item);
+    let primary = null;
+    let matchedKey = null;
+
+    for (const entry of duplicateKeys) {
+      const existingPrimary = existingByDuplicateKey.get(entry.value);
+      if (existingPrimary && normalizeKey(existingPrimary.imageId) !== normalizeKey(item.imageId)) {
+        primary = existingPrimary;
+        matchedKey = entry;
+        break;
+      }
+      const acceptedPrimary = acceptedByDuplicateKey.get(entry.value);
+      if (acceptedPrimary && normalizeKey(acceptedPrimary.imageId) !== normalizeKey(item.imageId)) {
+        primary = acceptedPrimary;
+        matchedKey = entry;
+        break;
+      }
+    }
+
+    if (primary && matchedKey) {
+      duplicateItems.push({
+        ...item,
+        duplicateMatchType: matchedKey.type,
+        duplicateFingerprint: matchedKey.value,
+        primaryImageId: primary.imageId || "",
+        primaryImageType: primary.imageType || "",
+        primaryTitle: primary.title || "",
+        primaryAuthor: primary.author || "",
+        primaryBook: primary.book || "",
+        primaryImageUrl: primary.imageUrl || "",
+        primaryDriveLink: primary.driveLink || "",
+      });
+      return;
+    }
+
+    acceptedItems.push(item);
+    duplicateKeys.forEach((entry) => {
+      if (!acceptedByDuplicateKey.has(entry.value)) {
+        acceptedByDuplicateKey.set(entry.value, {
+          imageId: item.imageId || "",
+          imageType: item.imageType || "",
+          title: item.title || "",
+          author: item.author || "",
+          book: item.book || "",
+          imageUrl: item.imageUrl || "",
+          driveLink: item.driveLink || "",
+          duplicateMatchType: entry.type,
+        });
+      }
+    });
+  });
+
+  return { acceptedItems, duplicateItems };
+}
+
+async function fetchRemoteJson(sourceUrl) {
+  const target = normalizeText(sourceUrl);
+  if (!/^https?:\/\//i.test(target)) {
+    const err = new Error("invalid_source_url");
+    err.status = 400;
+    throw err;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+  try {
+    const response = await fetch(target, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const err = new Error(`source_fetch_failed_${response.status}`);
+      err.status = 400;
+      throw err;
+    }
+    return await response.json();
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      const timeoutErr = new Error("source_fetch_timeout");
+      timeoutErr.status = 504;
+      throw timeoutErr;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function buildWeaverGraphicsImportItems(rawPayload, options = {}) {
+  const defaultImageType = normalizeText(options.defaultImageType || "QI").toUpperCase();
+  return flattenWeaverGraphicsRecords(rawPayload)
+    .filter((record) => shouldImportWeaverGraphicRecord(record, { defaultImageType }))
+    .map((record) => mapWeaverGraphicRecord(record, { defaultImageType }))
+    .filter((item) => item.docId && item.imageUrl);
+}
+
+function countCharacters(parts = []) {
+  return normalizeTextBody(parts.join(" ")).length;
+}
+
+function resolveScoreboardBookTitle(item = {}) {
+  return resolveCanonicalCatalogMetadata(item).book;
+}
+
+function resolvePigIdHygieneOverride(data = {}) {
+  const authorKey = normalizeCatalogLookupKey(data.author || "");
+  const titleKey = normalizeCatalogLookupKey(data.title || data.poem || "");
+  const bookKey = normalizeCatalogLookupKey(data.book || "");
+  if (bookKey === "short form contest may 2026" || bookKey === "short form 2026") {
+    return {
+      book: "Short Form 2026",
+      releaseCatalog: "Contest",
+      bookShortener: "SFC",
+    };
+  }
+  if (authorKey === "neil hilborn" && titleKey === "audiobook") {
+    return {
+      book: "The Future",
+      releaseCatalog: "Spring 2018",
+      bookShortener: "TF",
+    };
+  }
+  if (bookKey === "i ll fly away") {
+    return {
+      book: "I'll Fly Away",
+      releaseCatalog: "Fall 2020",
+      bookShortener: "IFA",
+    };
+  }
+  if (bookKey === "a love song a death rattle a battle cry") {
+    return {
+      book: "A Love Song, A Death Rattle, A Battle Cry",
+      releaseCatalog: "Spring 2018",
+      bookShortener: "ALSA",
+    };
+  }
+  if (bookKey === "so stranger") {
+    return {
+      book: "So, Stranger",
+      releaseCatalog: "Spring 2022",
+      bookShortener: "SS",
+    };
+  }
+  if (bookKey === "don t be afraid to be bad a big book of button poetry writing prompts") {
+    return {
+      book: "DON’T BE AFRAID TO BE BAD",
+      releaseCatalog: "Spring 2026",
+      bookShortener: "DBAT",
+    };
+  }
+  if (bookKey === "stunt water the work of buddy wakefield") {
+    return {
+      book: "Stunt Water",
+      releaseCatalog: "Spring 2026",
+      bookShortener: "SW",
+    };
+  }
+  return {};
+}
+
+function buildPigIdHygieneCandidate(doc, existingIds = new Set(), existingById = new Map()) {
+  const data = doc.data() || {};
+  const override = resolvePigIdHygieneOverride(data);
+  const currentId = normalizeText(data.imageId || data.contentId || doc.id);
+  const currentKey = normalizeKey(currentId);
+  const imageType = normalizeText(data.imageType || "").toUpperCase();
+  const canonical = resolveCanonicalCatalogMetadata({
+    ...data,
+    book: override.book || data.book || "",
+    bookShortener: override.bookShortener || data.bookShortener || "",
+    releaseCatalog: override.releaseCatalog || data.releaseCatalog || "",
+  });
+  const matched = canonical.match;
+  const bookShortener = sanitizeDocIdSegment(override.bookShortener || data.bookShortener || canonical.bookShortener || "");
+  const title = normalizeText(data.title || data.poem || "");
+  const canonicalBook = normalizeText(canonical.book || override.book || data.book || "");
+  const canonicalShortener = sanitizeDocIdSegment(canonical.bookShortener || bookShortener);
+  const canonicalCatalog = normalizeText(canonical.releaseCatalog || override.releaseCatalog || data.releaseCatalog || "");
+  const proposedId = bookShortener && imageType && title
+    ? `${bookShortener}-${imageType}-${slugify(title)}`.toUpperCase()
+    : "";
+  const metadataFixEligible = !!matched && (
+    (canonicalBook && normalizeKey(canonicalBook) !== normalizeKey(data.book || ""))
+    || (canonicalShortener && sanitizeDocIdSegment(data.bookShortener || "") !== canonicalShortener)
+    || (canonicalCatalog && normalizeKey(canonicalCatalog) !== normalizeKey(data.releaseCatalog || ""))
+  );
+  const reasons = [];
+  if (!currentKey.startsWith("pig-")) reasons.push("not_pig_id");
+  if (imageType !== "QI") reasons.push("not_qi");
+  if (!bookShortener) reasons.push("missing_book_shortener");
+  if (!title) reasons.push("missing_title");
+  if (!canonicalBook) reasons.push("missing_book");
+  if (!proposedId) reasons.push("missing_proposed_id");
+  if (normalizeKey(proposedId) === currentKey) reasons.push("already_canonical");
+  const existingCollision = proposedId ? existingById.get(normalizeKey(proposedId)) : null;
+  if (existingCollision) reasons.push("id_collision");
+  return {
+    docId: doc.id,
+    currentId,
+    proposedId,
+    eligible: reasons.length === 0,
+    metadataFixEligible,
+    reasons,
+    author: normalizeText(data.author || ""),
+    title,
+    book: normalizeText(data.book || ""),
+    canonicalBook,
+    releaseCatalog: canonicalCatalog,
+    originalReleaseCatalog: normalizeText(data.releaseCatalog || ""),
+    imageType,
+    bookShortener: canonicalShortener || bookShortener,
+    imageUrl: normalizeText(data.imageUrl || data.url || ""),
+    collisionImageUrl: normalizeText(existingCollision?.imageUrl || existingCollision?.url || ""),
+  };
+}
+
+async function buildPigIdHygienePlan() {
+  const snap = await db.collection(COLLECTIONS.graphics).get();
+  const existingIds = new Set();
+  const existingById = new Map();
+  snap.docs.forEach((doc) => {
+    const data = doc.data() || {};
+    [doc.id, data.imageId, data.contentId].forEach((value) => {
+      const key = normalizeKey(value || "");
+      if (key) existingIds.add(key);
+      if (key) existingById.set(key, { id: doc.id, ...data });
+    });
+  });
+  const rows = snap.docs
+    .map((doc) => buildPigIdHygieneCandidate(doc, existingIds, existingById))
+    .filter((row) => normalizeKey(row.currentId).startsWith("pig-"));
+  const reserveProposedId = (baseId, currentImageUrl = "") => {
+    const baseKey = normalizeKey(baseId);
+    const currentAssetKey = normalizeKey(currentImageUrl || "");
+    const existing = existingById.get(baseKey);
+    if (existing) {
+      const existingAssetKey = normalizeKey(existing.imageUrl || existing.url || "");
+      if (currentAssetKey && existingAssetKey && currentAssetKey === existingAssetKey) {
+        return { proposedId: baseId, blockedReason: "duplicate_graphic_review" };
+      }
+    }
+    for (let suffix = existing ? 2 : 1; suffix <= 50; suffix += 1) {
+      const candidate = suffix === 1 ? baseId : `${baseId}-${suffix}`;
+      const key = normalizeKey(candidate);
+      if (!existingIds.has(key)) {
+        existingIds.add(key);
+        return { proposedId: candidate, suffix };
+      }
+      const candidateExisting = existingById.get(key);
+      const candidateAssetKey = normalizeKey(candidateExisting?.imageUrl || candidateExisting?.url || "");
+      if (currentAssetKey && candidateAssetKey && currentAssetKey === candidateAssetKey) {
+        return { proposedId: candidate, blockedReason: "duplicate_graphic_review" };
+      }
+    }
+    return { proposedId: baseId, blockedReason: "suffix_exhausted" };
+  };
+  rows.forEach((row) => {
+    if (!row.proposedId || !row.reasons.includes("id_collision")) return;
+    const collision = reserveProposedId(row.proposedId, row.imageUrl);
+    row.duplicateBaseId = row.proposedId;
+    row.proposedId = collision.proposedId;
+    row.reasons = row.reasons.filter((reason) => reason !== "id_collision");
+    if (collision.blockedReason) {
+      row.eligible = false;
+      row.reasons = uniq([...row.reasons, collision.blockedReason]);
+      return;
+    }
+    row.eligible = row.reasons.length === 0;
+    row.uniqueGraphicWithDuplicateName = Number(collision.suffix || 1) > 1;
+    row.collisionResolvedWithSuffix = row.uniqueGraphicWithDuplicateName;
+  });
+  const proposedGroups = new Map();
+  rows.forEach((row) => {
+    const key = normalizeKey(row.proposedId);
+    if (!key) return;
+    proposedGroups.set(key, [...(proposedGroups.get(key) || []), row]);
+  });
+  proposedGroups.forEach((group, key) => {
+    if (group.length <= 1) return;
+    const seenAssetUrls = new Set();
+    group
+      .sort((a, b) => normalizeText(a.currentId).localeCompare(normalizeText(b.currentId)))
+      .forEach((row, index) => {
+        const assetKey = normalizeKey(row.imageUrl || "");
+        row.duplicateGroupSize = group.length;
+        row.duplicateBaseId = row.proposedId;
+        if (assetKey && seenAssetUrls.has(assetKey)) {
+          row.eligible = false;
+          row.reasons = uniq([...row.reasons.filter((reason) => reason !== "duplicate_proposed_id"), "duplicate_graphic_review"]);
+          return;
+        }
+        if (assetKey) seenAssetUrls.add(assetKey);
+        if (row.reasons.length) return;
+        const suffix = index + 1;
+        row.proposedId = suffix === 1 ? row.proposedId : `${row.proposedId}-${suffix}`;
+        row.uniqueGraphicWithDuplicateName = suffix > 1;
+        if (existingIds.has(normalizeKey(row.proposedId))) {
+          row.eligible = false;
+          row.reasons = uniq([...row.reasons, "id_collision_after_suffix"]);
+        }
+      });
+  });
+  rows.sort((a, b) => (
+    Number(b.eligible) - Number(a.eligible)
+    || normalizeText(a.releaseCatalog).localeCompare(normalizeText(b.releaseCatalog))
+    || normalizeText(a.canonicalBook || a.book).localeCompare(normalizeText(b.canonicalBook || b.book))
+    || normalizeText(a.currentId).localeCompare(normalizeText(b.currentId))
+  ));
+  return rows;
+}
+
+async function applyPigIdHygieneRows(rows = [], actor = {}) {
+  const eligibleRows = rows.filter((row) => row.eligible).slice(0, 100);
+  const metadataRows = rows.filter((row) => !row.eligible && row.metadataFixEligible).slice(0, 250);
+  const results = [];
+  for (const row of eligibleRows) {
+    const oldRef = db.collection(COLLECTIONS.graphics).doc(row.docId);
+    const oldSnap = await oldRef.get();
+    if (!oldSnap.exists) {
+      results.push({ ok: false, currentId: row.currentId, proposedId: row.proposedId, error: "source_missing" });
+      continue;
+    }
+    const targetRef = db.collection(COLLECTIONS.graphics).doc(row.proposedId);
+    const targetSnap = await targetRef.get();
+    if (targetSnap.exists) {
+      results.push({ ok: false, currentId: row.currentId, proposedId: row.proposedId, error: "target_exists" });
+      continue;
+    }
+    const existing = oldSnap.data() || {};
+    const next = {
+      ...existing,
+      imageId: row.proposedId,
+      contentId: row.proposedId,
+      book: row.canonicalBook || existing.book || "",
+      bookShortener: row.bookShortener || existing.bookShortener || "",
+      releaseCatalog: row.releaseCatalog || existing.releaseCatalog || "",
+      previousImageIds: uniq([...(Array.isArray(existing.previousImageIds) ? existing.previousImageIds : []), row.currentId].filter(Boolean)),
+      duplicateBaseId: row.duplicateBaseId || "",
+      duplicateGroupSize: row.duplicateGroupSize || 0,
+      uniqueGraphicWithDuplicateName: !!row.uniqueGraphicWithDuplicateName,
+      renamedFrom: row.currentId,
+      renamedAt: FieldValue.serverTimestamp(),
+      renamedBy: normalizeText(actor.email || actor.uid || ""),
+      updatedAt: FieldValue.serverTimestamp(),
+      updatedBy: normalizeText(actor.email || actor.uid || ""),
+    };
+    await db.runTransaction(async (tx) => {
+      const freshTarget = await tx.get(targetRef);
+      if (freshTarget.exists) throw new Error("target_exists");
+      tx.set(targetRef, next);
+      tx.delete(oldRef);
+    });
+
+    const votesSnap = await db.collection(COLLECTIONS.votes).where("imageId", "==", row.currentId).get();
+    const flagsSnap = await db.collection(COLLECTIONS.contentFlags).where("imageId", "==", row.currentId).get();
+    const claimsSnap = await db.collection(COLLECTIONS.contentClaims).where("imageId", "==", row.currentId).get();
+    const refs = [...votesSnap.docs, ...flagsSnap.docs, ...claimsSnap.docs];
+    for (let i = 0; i < refs.length; i += 400) {
+      const batch = db.batch();
+      refs.slice(i, i + 400).forEach((doc) => {
+        batch.set(doc.ref, {
+          imageId: row.proposedId,
+          previousImageId: row.currentId,
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      });
+      await batch.commit();
+    }
+    results.push({
+      ok: true,
+      action: "rename",
+      currentId: row.currentId,
+      proposedId: row.proposedId,
+      updatedReferences: refs.length,
+    });
+  }
+  for (const row of metadataRows) {
+    const ref = db.collection(COLLECTIONS.graphics).doc(row.docId);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      results.push({ ok: false, action: "metadata", currentId: row.currentId, error: "source_missing" });
+      continue;
+    }
+    const existing = snap.data() || {};
+    await ref.set({
+      book: row.canonicalBook || existing.book || "",
+      bookShortener: row.bookShortener || existing.bookShortener || "",
+      releaseCatalog: row.releaseCatalog || existing.releaseCatalog || "",
+      metadataHygieneAt: FieldValue.serverTimestamp(),
+      metadataHygieneBy: normalizeText(actor.email || actor.uid || ""),
+      updatedAt: FieldValue.serverTimestamp(),
+      updatedBy: normalizeText(actor.email || actor.uid || ""),
+    }, { merge: true });
+    results.push({
+      ok: true,
+      action: "metadata",
+      currentId: row.currentId,
+      proposedId: "",
+      updatedReferences: 0,
+    });
+  }
+  if (results.some((row) => row.ok)) {
+    invalidateContentCache();
+    await invalidateScoreboardSnapshot("pig_id_hygiene");
+  }
+  return results;
+}
+
+async function buildScoreboardPayload() {
+  const [voteDocs, metaObjs, excerptObjs, fullPoemObjs, videoObjs, flaggedIds, authorVoteIdentities] = await Promise.all([
+    getAllVotes(),
+    getAllFrom(COLLECTIONS.graphics),
+    getAllFrom(COLLECTIONS.excerpts),
+    getAllFrom(COLLECTIONS.fullPoems),
+    getAllFrom(COLLECTIONS.videos),
+    getFlaggedContentIds(),
+    getAuthorVoteIdentities(),
+  ]);
+
+  const latestByUserImage = new Map();
+  voteDocs.forEach((vote) => {
+    const user = normalizeText(vote.userId);
+    const imageId = normalizeText(vote.imageId);
+    if (!user || !imageId) return;
+    if (flaggedIds.has(normalizeKey(imageId))) return;
+    const key = `${normalizeKey(user)}|${normalizeKey(imageId)}`;
+    const time = timestampToMs(vote.timestamp);
+    const current = latestByUserImage.get(key);
+    if (!current || time > current.time) {
+      latestByUserImage.set(key, {
+        imageId,
+        vote: vote.voteType || "",
+        user,
+        time,
+      });
+    }
+  });
+
+  const rawVotes = Array.from(latestByUserImage.values());
+  const metaMap = new Map();
+  const upsertMeta = (item) => {
+    const imageId = normalizeText(item?.imageId);
+    const contentId = normalizeText(item?.contentId);
+    const keys = uniq([imageId, contentId].filter(Boolean));
+    if (!keys.length) return;
+    if (keys.some((key) => flaggedIds.has(normalizeKey(key)))) return;
+    const cloudLink = normalizeText(item.imageUrl || item.url || item.videoUrl || "");
+    const driveLink = normalizeText(item.driveLink || "");
+    const sourceFolderLink = normalizeText(item.sourceFolderLink || readMiscValue(item.misc, "sourceFolderLink"));
+    const sourceFileName = normalizeText(item.sourceFileName || readMiscValue(item.misc, "sourceFileName"));
+    const bookTitle = resolveScoreboardBookTitle({ ...item, sourceFileName });
+    const canonicalCatalog = resolveCanonicalCatalogMetadata({ ...item, book: bookTitle, sourceFileName });
+    const payload = {
+      imageId: imageId || contentId,
+      author: canonicalizeAuthorName(item.author || ""),
+      poemTitle: item.title || item.poem || "",
+      bookTitle,
+      originalBookTitle: item.book || "",
+      bookShortener: canonicalCatalog.bookShortener || item.bookShortener || "",
+      fileLink: cloudLink || item.bookLink || "",
+      cloudLink,
+      driveLink,
+      sourceFolderLink,
+      sourceFileName,
+      type: item.imageType || "",
+      excerpt: item.excerpt || "",
+      releaseCatalog: canonicalCatalog.releaseCatalog || item.releaseCatalog || "",
+      charCount: countCharacters([item.author || "", item.title || item.poem || "", item.excerpt || ""]),
+    };
+    keys.forEach((key) => metaMap.set(key, payload));
+  };
+  metaObjs.forEach(upsertMeta);
+  excerptObjs.forEach(upsertMeta);
+  fullPoemObjs.forEach(upsertMeta);
+  videoObjs.forEach(upsertMeta);
+
+  const contentRows = Array.from(new Map(
+    Array.from(metaMap.values()).map((meta) => [normalizeKey(meta.imageId), meta])
+  ).values());
+  const poemKeysForScore = (item = {}) => {
+    const author = normalizeKey(item.author || "");
+    const book = normalizeCatalogLookupKey(item.bookTitle || item.book || "");
+    const shortener = sanitizeDocIdSegment(item.bookShortener || "");
+    const title = normalizeKey(item.poemTitle || item.title || item.poem || "");
+    if (!title) return [];
+    return uniq([
+      shortener ? `shortener:${shortener}|${title}` : "",
+      author && book ? `metadata:${author}|${book}|${title}` : "",
+    ].filter(Boolean));
+  };
+  const fpDerivativePointsByImageId = new Map();
+  const fpImageIdsByPoemKey = new Map();
+  contentRows.forEach((item) => {
+    if (normalizeKey(item.type) !== "fp") return;
+    const imageId = normalizeText(item.imageId);
+    const poemKeys = poemKeysForScore(item);
+    if (!poemKeys.length || !imageId) return;
+    poemKeys.forEach((poemKey) => fpImageIdsByPoemKey.set(poemKey, [...(fpImageIdsByPoemKey.get(poemKey) || []), imageId]));
+    fpDerivativePointsByImageId.set(imageId, 0);
+  });
+  contentRows.forEach((item) => {
+    const rawType = normalizeKey(item.type);
+    const type = rawType === "quote images" ? "qi"
+      : rawType === "excerpts" ? "exc"
+        : rawType === "interiors" ? "int"
+          : rawType === "vertical video" ? "vv"
+            : rawType === "youtube" ? "yt"
+              : rawType;
+    if (!["exc", "qi", "int", "vv", "yt"].includes(type)) return;
+    const matchingFpIds = new Set(poemKeysForScore(item).flatMap((poemKey) => fpImageIdsByPoemKey.get(poemKey) || []));
+    matchingFpIds.forEach((imageId) => {
+      fpDerivativePointsByImageId.set(imageId, (fpDerivativePointsByImageId.get(imageId) || 0) + 1);
+    });
+  });
+
+  const enrichedVotes = rawVotes.map((vote) => {
+    const meta = metaMap.get(vote.imageId) || {};
+    const normalizedImageId = normalizeKey(vote.imageId);
+    const inferredType = meta.type
+      || (normalizedImageId.includes("-fp-") ? "FP" : "")
+      || (normalizedImageId.includes("-exc-") ? "EXC" : "")
+      || (normalizedImageId.includes("-yt-") || normalizeKey(meta.fileLink).includes("youtube.com") || normalizeKey(meta.fileLink).includes("youtu.be") ? "YT" : "")
+      || (normalizedImageId.endsWith(".mp4") || normalizedImageId.includes("-vv-") ? "VV" : "")
+      || "";
+    return {
+      imageId: vote.imageId,
+      vote: vote.vote,
+      user: vote.user,
+      time: vote.time || 0,
+      author: meta.author || "‹no author›",
+      poemTitle: meta.poemTitle || "‹no title›",
+      bookTitle: meta.bookTitle || "‹no book›",
+      originalBookTitle: meta.originalBookTitle || "",
+      bookShortener: meta.bookShortener || "",
+      fileLink: meta.fileLink || "",
+      cloudLink: meta.cloudLink || "",
+      driveLink: meta.driveLink || "",
+      sourceFolderLink: meta.sourceFolderLink || "",
+      sourceFileName: meta.sourceFileName || "",
+      type: inferredType,
+      excerpt: meta.excerpt || "",
+      releaseCatalog: meta.releaseCatalog || "",
+      charCount: Number(meta.charCount || 0) || 0,
+    };
+  });
+
+  const board = new Map();
+  enrichedVotes.forEach((vote) => {
+    if (!board.has(vote.imageId)) {
+      board.set(vote.imageId, {
+        imageId: vote.imageId,
+        author: vote.author,
+        poemTitle: vote.poemTitle,
+        bookTitle: vote.bookTitle,
+        originalBookTitle: vote.originalBookTitle || "",
+        bookShortener: vote.bookShortener || "",
+        fileLink: vote.fileLink,
+        cloudLink: vote.cloudLink || "",
+        driveLink: vote.driveLink || "",
+        sourceFolderLink: vote.sourceFolderLink || "",
+        sourceFileName: vote.sourceFileName || "",
+        excerpt: vote.excerpt || "",
+        likes: 0,
+        dislikes: 0,
+        meh: 0,
+        movedMe: 0,
+        authorLikes: 0,
+        authorDislikes: 0,
+        authorMovedMe: 0,
+        totalVotes: 0,
+        fpDerivativePoints: 0,
+        type: vote.type || "",
+        releaseCatalog: vote.releaseCatalog || "",
+        charCount: Number(vote.charCount || 0) || 0,
+      });
+    }
+    const entry = board.get(vote.imageId);
+    const authorNames = authorVoteIdentities.get(normalizeKey(vote.user || ""));
+    const isAuthorVote = !!authorNames?.has(normalizeKey(vote.author || ""));
+    if (vote.vote === "like") entry.likes += 1;
+    else if (vote.vote === "dislike") entry.dislikes += 1;
+    else if (vote.vote === "meh") entry.meh += 1;
+    else if (vote.vote === "moved me") entry.movedMe += 1;
+    if (isAuthorVote) {
+      if (vote.vote === "like") entry.authorLikes += 1;
+      else if (vote.vote === "dislike") entry.authorDislikes += 1;
+      else if (vote.vote === "moved me") entry.authorMovedMe += 1;
+    }
+    entry.totalVotes += 1;
+  });
+
+  metaMap.forEach((meta) => {
+    const imageId = normalizeText(meta.imageId);
+    if (!imageId || board.has(imageId)) return;
+    board.set(imageId, {
+      imageId,
+      author: meta.author || "‹no author›",
+      poemTitle: meta.poemTitle || "‹no title›",
+      bookTitle: meta.bookTitle || "‹no book›",
+      originalBookTitle: meta.originalBookTitle || "",
+      bookShortener: meta.bookShortener || "",
+      fileLink: meta.fileLink || "",
+      cloudLink: meta.cloudLink || "",
+      driveLink: meta.driveLink || "",
+      sourceFolderLink: meta.sourceFolderLink || "",
+      sourceFileName: meta.sourceFileName || "",
+      excerpt: meta.excerpt || "",
+      likes: 0,
+      dislikes: 0,
+      meh: 0,
+      movedMe: 0,
+      authorLikes: 0,
+      authorDislikes: 0,
+      authorMovedMe: 0,
+      totalVotes: 0,
+      fpDerivativePoints: 0,
+      type: meta.type || "",
+      releaseCatalog: meta.releaseCatalog || "",
+      charCount: Number(meta.charCount || 0) || 0,
+    });
+  });
+
+  const aggregated = Array.from(board.values()).map((entry) => ({
+    ...entry,
+    fpDerivativePoints: normalizeKey(entry.type) === "fp" ? Number(fpDerivativePointsByImageId.get(entry.imageId) || 0) : 0,
+    authorExcluded: Number(entry.authorDislikes || 0) > 0,
+    score: entry.likes
+      + (entry.movedMe * 2)
+      - entry.dislikes
+      + (entry.authorLikes * 9)
+      + (entry.authorMovedMe * 23)
+      - (entry.authorDislikes * 99)
+      + (normalizeKey(entry.type) === "fp" ? Number(fpDerivativePointsByImageId.get(entry.imageId) || 0) : 0),
+  }));
+
+  const flaggedKeySet = flaggedIds;
+  const allGraphics = [...metaObjs, ...excerptObjs, ...fullPoemObjs, ...videoObjs]
+    .map((item) => ({
+      imageId: item.imageId || "",
+      bookTitle: resolveScoreboardBookTitle(item) || "‹no book›",
+      originalBookTitle: item.book || "",
+      bookShortener: item.bookShortener || "",
+      type: item.imageType || "",
+      releaseCatalog: item.releaseCatalog || "",
+      missingCatalog: !normalizeText(item.releaseCatalog),
+      missingBucketUrl: ["QI", "INT", "GP", "VV"].includes(normalizeText(item.imageType).toUpperCase()) && !normalizeText(item.imageUrl || item.videoUrl || item.url),
+      flagged: flaggedKeySet.has(normalizeKey(item.imageId || "")),
+    }));
+
+  return {
+    aggregated,
+    rawVotes: enrichedVotes,
+    allGraphics,
+  };
+}
+
+function normalizeTextBody(value) {
+  return normalizeText(value)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function buildTextMetadataSignature({ author = "", title = "", book = "" }) {
+  return [
+    normalizeCatalogLookupKey(author),
+    normalizeCatalogLookupKey(title),
+    normalizeCatalogLookupKey(book),
+  ].join("|");
+}
+
+function buildStableTextHash({ type = "", author = "", title = "", book = "", text = "" }) {
+  const payload = [
+    normalizeKey(type),
+    normalizeCatalogLookupKey(author),
+    normalizeCatalogLookupKey(title),
+    normalizeCatalogLookupKey(book),
+    normalizeTextBody(text),
+  ].join("||");
+  return createHash("sha256").update(payload).digest("hex");
+}
+
+async function buildRankedTextsPayload({
+  limit = 100,
+  minScore = 1,
+  minVotes = 1,
+  types = ["EXC", "FP"],
+} = {}) {
+  const normalizedTypes = uniq(
+    (Array.isArray(types) ? types : [types])
+      .map((type) => normalizeText(type).toUpperCase())
+      .filter((type) => ["EXC", "FP"].includes(type))
+  );
+
+  const [
+    scoreboardResult,
+    excerptItems,
+    fullPoemItems,
+    graphicItems,
+    flaggedIds,
+  ] = await Promise.all([
+    getScoreboardPayloadFromSnapshot(),
+    getAllFrom(COLLECTIONS.excerpts),
+    getAllFrom(COLLECTIONS.fullPoems),
+    getAllFrom(COLLECTIONS.graphics),
+    getFlaggedContentIds(),
+  ]);
+
+  const aggregatedByImageId = new Map();
+  (scoreboardResult?.payload?.aggregated || []).forEach((row) => {
+    const imageId = normalizeText(row?.imageId);
+    if (imageId) aggregatedByImageId.set(imageId, row);
+  });
+
+  const matchingGraphicsBySignature = new Map();
+  graphicItems.forEach((item) => {
+    if (flaggedIds.has(normalizeKey(item.imageId || ""))) return;
+    const imageType = normalizeText(item.imageType).toUpperCase();
+    if (!imageType || imageType === "EXC" || imageType === "FP") return;
+    const signature = buildTextMetadataSignature(item);
+    if (!signature.replace(/\|/g, "")) return;
+    const payload = {
+      imageId: item.imageId || "",
+      contentId: item.contentId || "",
+      imageType,
+      title: item.title || "",
+      author: item.author || "",
+      book: item.book || "",
+      imageUrl: item.imageUrl || "",
+      driveLink: item.driveLink || "",
+      bookLink: item.bookLink || "",
+      releaseCatalog: item.releaseCatalog || "",
+    };
+    matchingGraphicsBySignature.set(signature, [
+      ...(matchingGraphicsBySignature.get(signature) || []),
+      payload,
+    ]);
+  });
+
+  const candidates = [...excerptItems, ...fullPoemItems]
+    .filter((item) => normalizedTypes.includes(normalizeText(item.imageType).toUpperCase()))
+    .filter((item) => !flaggedIds.has(normalizeKey(item.imageId || "")))
+    .map((item) => {
+      const voteStats = aggregatedByImageId.get(item.imageId || "") || {};
+      const text = normalizeTextBody(item.excerpt || "");
+      const textHash = buildStableTextHash({
+        type: item.imageType || "",
+        author: item.author || "",
+        title: item.title || "",
+        book: item.book || "",
+        text,
+      });
+      const signature = buildTextMetadataSignature(item);
+      return {
+        textHash,
+        signature,
+        sourceType: normalizeText(item.imageType).toUpperCase(),
+        sourceRecordId: item.imageId || item.contentId || "",
+        contentId: item.contentId || "",
+        imageId: item.imageId || "",
+        author: item.author || "",
+        title: item.title || "",
+        book: item.book || "",
+        text,
+        releaseCatalog: item.releaseCatalog || "",
+        bookLink: item.bookLink || "",
+        score: Number(voteStats.score || 0),
+        likes: Number(voteStats.likes || 0),
+        dislikes: Number(voteStats.dislikes || 0),
+        meh: Number(voteStats.meh || 0),
+        movedMe: Number(voteStats.movedMe || 0),
+        totalVotes: Number(voteStats.totalVotes || 0),
+      };
+    })
+    .filter((item) => item.text)
+    .filter((item) => item.totalVotes >= minVotes)
+    .filter((item) => item.score >= minScore);
+
+  const groupedByTextHash = new Map();
+  candidates.forEach((item) => {
+    const current = groupedByTextHash.get(item.textHash);
+    if (!current) {
+      groupedByTextHash.set(item.textHash, {
+        ...item,
+        sourceRecordIds: uniq([item.sourceRecordId].filter(Boolean)),
+        siblingRecordCount: 1,
+      });
+      return;
+    }
+    const shouldReplaceRepresentative = (
+      item.score > current.score
+      || (item.score === current.score && item.totalVotes > current.totalVotes)
+    );
+    current.score += item.score;
+    current.likes += item.likes;
+    current.dislikes += item.dislikes;
+    current.meh += item.meh;
+    current.movedMe += item.movedMe;
+    current.totalVotes += item.totalVotes;
+    current.siblingRecordCount += 1;
+    current.sourceRecordIds = uniq([...current.sourceRecordIds, item.sourceRecordId].filter(Boolean));
+    if (shouldReplaceRepresentative) {
+      Object.assign(current, {
+        sourceType: item.sourceType,
+        sourceRecordId: item.sourceRecordId,
+        contentId: item.contentId,
+        imageId: item.imageId,
+        author: item.author,
+        title: item.title,
+        book: item.book,
+        text: item.text,
+        releaseCatalog: item.releaseCatalog,
+        bookLink: item.bookLink,
+        signature: item.signature,
+      });
+    }
+  });
+
+  const rows = Array.from(groupedByTextHash.values())
+    .sort((a, b) => (
+      (b.score - a.score)
+      || (b.movedMe - a.movedMe)
+      || (b.totalVotes - a.totalVotes)
+      || a.author.localeCompare(b.author)
+      || a.title.localeCompare(b.title)
+    ))
+    .slice(0, limit)
+    .map((item, index) => {
+      const matchingGraphics = (matchingGraphicsBySignature.get(item.signature) || []).slice(0, 12);
+      return {
+        rank: index + 1,
+        textId: `PP:${item.sourceType}:${item.textHash.slice(0, 16).toUpperCase()}`,
+        textHash: item.textHash,
+        sourceSystem: "poetry_please",
+        sourceType: item.sourceType,
+        sourceRecordId: item.sourceRecordId,
+        sourceRecordIds: item.sourceRecordIds,
+        siblingRecordCount: item.siblingRecordCount,
+        author: item.author,
+        title: item.title,
+        book: item.book,
+        text: item.text,
+        releaseCatalog: item.releaseCatalog || "",
+        bookLink: item.bookLink || "",
+        score: item.score,
+        likes: item.likes,
+        dislikes: item.dislikes,
+        meh: item.meh,
+        movedMe: item.movedMe,
+        totalVotes: item.totalVotes,
+        matchingStrategy: "metadata_exact",
+        matchingGraphicCount: matchingGraphics.length,
+        matchingGraphics,
+      };
+    });
+
+  return {
+    rows,
+    count: rows.length,
+    filters: {
+      limit,
+      minScore,
+      minVotes,
+      types: normalizedTypes,
+    },
+    snapshotMeta: scoreboardResult?.builtAtMs ? {
+      source: scoreboardResult.source,
+      builtAtMs: scoreboardResult.builtAtMs,
+      ttlMs: SCOREBOARD_SNAPSHOT_TTL_MS,
+    } : null,
+  };
+}
+
+async function getScoreboardBootstrapPayload() {
+  const [allContent, flaggedIds] = await Promise.all([
+    getAllContent(),
+    getFlaggedContentIds(),
+  ]);
+  const sample = allContent.find((item) => !flaggedIds.has(normalizeKey(item.imageId || ""))) || null;
+  return {
+    ok: true,
+    sample: sample ? {
+      imageId: sample.imageId || "",
+      title: sample.title || "",
+      author: sample.author || "",
+      book: sample.book || "",
+      type: sample.imageType || "",
+    } : null,
+  };
+}
+
+async function getCachedScoreboardPayload() {
+  const now = Date.now();
+  if (scoreboardCache.payload && (now - scoreboardCache.builtAt) < SCOREBOARD_CACHE_TTL_MS) {
+    return scoreboardCache.payload;
+  }
+  if (scoreboardCache.inFlight) {
+    return scoreboardCache.inFlight;
+  }
+  scoreboardCache.inFlight = buildScoreboardPayload()
+    .then((payload) => {
+      scoreboardCache.payload = payload;
+      scoreboardCache.builtAt = Date.now();
+      scoreboardCache.inFlight = null;
+      return payload;
+    })
+    .catch((err) => {
+      scoreboardCache.inFlight = null;
+      throw err;
+  });
+  return scoreboardCache.inFlight;
+}
+
+async function buildInternalCoverageCountsPayload(contentType = "QI") {
+  const normalizedType = normalizeText(contentType || "QI").toUpperCase();
+  const result = await getScoreboardPayloadFromSnapshot();
+  const countsByBookKey = {};
+  (result?.payload?.aggregated || []).forEach((row) => {
+    if (normalizeText(row?.type).toUpperCase() !== normalizedType) return;
+    const canonical = resolveCanonicalCatalogMetadata({
+      author: row?.author || "",
+      book: row?.bookTitle || row?.book || "",
+      bookShortener: row?.bookShortener || "",
+      sourceFileName: row?.sourceFileName || row?.imageId || "",
+    });
+    if (!canonical.matched) return;
+    const bookTitle = normalizeText(canonical.book || row?.bookTitle || row?.book || "");
+    const bookKey = normalizeCatalogLookupKey(bookTitle);
+    if (!bookKey) return;
+    const current = countsByBookKey[bookKey] || {
+      bookKey,
+      bookTitle,
+      count: 0,
+      contentType: normalizedType,
+      entityType: canonical.entityType,
+      canonicalSource: canonical.canonicalSource,
+    };
+    current.count += 1;
+    current.bookTitle = current.bookTitle || bookTitle;
+    countsByBookKey[bookKey] = current;
+  });
+  return {
+    ok: true,
+    contentType: normalizedType,
+    counts: Object.values(countsByBookKey),
+    snapshotMeta: {
+      source: result.source,
+      builtAtMs: result.builtAtMs,
+      ttlMs: SCOREBOARD_SNAPSHOT_TTL_MS,
+    },
+  };
+}
+
+async function buildInternalIntFpiCoveragePayload() {
+  const target = 10;
+  const result = await getScoreboardPayloadFromSnapshot();
+  const countsByBookKey = {};
+  (result?.payload?.aggregated || []).forEach((row) => {
+    const canonical = resolveCanonicalCatalogMetadata({
+      author: row?.author || "",
+      book: row?.bookTitle || row?.book || "",
+      bookShortener: row?.bookShortener || "",
+      sourceFileName: row?.sourceFileName || row?.imageId || "",
+    });
+    if (!canonical.matched) return;
+    const bookTitle = normalizeText(canonical.book || row?.bookTitle || row?.book || "");
+    const bookKey = normalizeCatalogLookupKey(bookTitle);
+    if (!bookKey) return;
+    const current = countsByBookKey[bookKey] || {
+      bookKey,
+      bookTitle,
+      intCount: 0,
+      fpiCount: 0,
+      entityType: canonical.entityType,
+      canonicalSource: canonical.canonicalSource,
+    };
+    const type = normalizeText(row?.type).toUpperCase();
+    if (type === "INT") current.intCount += 1;
+    if (type === "FPI") current.fpiCount += 1;
+    current.bookTitle = current.bookTitle || bookTitle;
+    countsByBookKey[bookKey] = current;
+  });
+  const counts = Object.values(countsByBookKey).map((row) => {
+    const combinedCount = row.intCount + row.fpiCount;
+    return {
+      ...row,
+      combinedCount,
+      target,
+      remaining: Math.max(0, target - combinedCount),
+      complete: combinedCount >= target,
+    };
+  });
+  return {
+    ok: true,
+    lane: "INT_FPI",
+    contentTypes: ["INT", "FPI"],
+    target,
+    counts,
+    snapshotMeta: {
+      source: result.source,
+      builtAtMs: result.builtAtMs,
+      ttlMs: SCOREBOARD_SNAPSHOT_TTL_MS,
+    },
+  };
+}
+
+async function buildInternalContentScoresPayload(contentType = "FPI") {
+  const normalizedType = normalizeText(contentType || "FPI").toUpperCase();
+  const [result, sourceItems] = await Promise.all([
+    getScoreboardPayloadFromSnapshot(),
+    normalizedType === "FP"
+      ? getAllFrom(COLLECTIONS.fullPoems)
+      : getAllFrom(COLLECTIONS.graphics),
+  ]);
+  const scoreById = new Map();
+  (result?.payload?.aggregated || []).forEach((row) => {
+    const keys = [row?.imageId, row?.contentId].map((value) => normalizeKey(value)).filter(Boolean);
+    keys.forEach((key) => scoreById.set(key, row));
+  });
+  const rows = (sourceItems || [])
+    .filter((item) => normalizeText(item?.imageType).toUpperCase() === normalizedType)
+    .map((item) => {
+      const contentId = item.contentId || item.imageId || item.id || "";
+      const imageId = item.imageId || item.contentId || item.id || "";
+      const scoreRow = scoreById.get(normalizeKey(imageId)) || scoreById.get(normalizeKey(contentId)) || {};
+      return {
+        contentId,
+        imageId,
+        imageType: normalizedType,
+        author: item.author || scoreRow.author || "",
+        title: item.title || scoreRow.poemTitle || "",
+        book: item.book || scoreRow.bookTitle || "",
+        originalBook: scoreRow.originalBookTitle || item.originalBookTitle || "",
+        bookShortener: item.bookShortener || scoreRow.bookShortener || "",
+        releaseCatalog: item.releaseCatalog || scoreRow.releaseCatalog || "",
+        fileLink: item.fileLink || scoreRow.fileLink || "",
+        cloudLink: item.cloudLink || scoreRow.cloudLink || "",
+        driveLink: item.driveLink || scoreRow.driveLink || "",
+        score: Number(scoreRow.score || 0),
+        likes: Number(scoreRow.likes || 0),
+        dislikes: Number(scoreRow.dislikes || 0),
+        meh: Number(scoreRow.meh || 0),
+        movedMe: Number(scoreRow.movedMe || 0),
+        authorLikes: Number(scoreRow.authorLikes || 0),
+        authorDislikes: Number(scoreRow.authorDislikes || 0),
+        authorMovedMe: Number(scoreRow.authorMovedMe || 0),
+        totalVotes: Number(scoreRow.totalVotes || 0),
+      };
+    })
+    .sort((a, b) => (
+      (Number(b.score || 0) - Number(a.score || 0))
+      || (Number(b.movedMe || 0) - Number(a.movedMe || 0))
+      || (Number(b.totalVotes || 0) - Number(a.totalVotes || 0))
+      || String(a.author || "").localeCompare(String(b.author || ""))
+      || String(a.title || "").localeCompare(String(b.title || ""))
+    ))
+    .map((row, index) => ({
+      rank: index + 1,
+      ...row,
+    }));
+  return {
+    ok: true,
+    contentType: normalizedType,
+    count: rows.length,
+    rows,
+    snapshotMeta: {
+      source: result.source,
+      builtAtMs: result.builtAtMs,
+      ttlMs: SCOREBOARD_SNAPSHOT_TTL_MS,
+    },
+  };
+}
+
+async function readScoreboardSnapshot() {
+  const metaRef = db.collection(COLLECTIONS.systemState).doc(SCOREBOARD_SNAPSHOT_DOC_ID);
+  const metaSnap = await metaRef.get();
+  if (!metaSnap.exists) return null;
+  const meta = metaSnap.data() || {};
+  const builtAtMs = timestampToMs(meta.builtAt);
+  const storagePath = normalizeText(meta.storagePath || SCOREBOARD_SNAPSHOT_PATH);
+  if (!builtAtMs || !storagePath) return null;
+  if (Number(meta.version || 1) !== SCOREBOARD_SNAPSHOT_VERSION) return null;
+
+  const [buffer] = await storage.bucket().file(storagePath).download();
+  const payload = JSON.parse(buffer.toString("utf8"));
+  return { payload, meta, builtAtMs };
+}
+
+async function writeScoreboardSnapshot(payload) {
+  const file = storage.bucket().file(SCOREBOARD_SNAPSHOT_PATH);
+  const json = JSON.stringify(payload);
+  await file.save(json, {
+    contentType: "application/json; charset=utf-8",
+    resumable: false,
+    metadata: {
+      cacheControl: "no-store, max-age=0",
+    },
+  });
+
+  const snapshotMeta = {
+    storagePath: SCOREBOARD_SNAPSHOT_PATH,
+    version: SCOREBOARD_SNAPSHOT_VERSION,
+    builtAt: FieldValue.serverTimestamp(),
+    aggregatedCount: Array.isArray(payload?.aggregated) ? payload.aggregated.length : 0,
+    rawVotesCount: Array.isArray(payload?.rawVotes) ? payload.rawVotes.length : 0,
+    allGraphicsCount: Array.isArray(payload?.allGraphics) ? payload.allGraphics.length : 0,
+    updatedBy: "server",
+  };
+  await db.collection(COLLECTIONS.systemState).doc(SCOREBOARD_SNAPSHOT_DOC_ID).set(snapshotMeta, { merge: true });
+}
+
+async function getGoogleApiAccessToken() {
+  const tokenResult = await appAdmin.options.credential.getAccessToken();
+  return tokenResult?.access_token || tokenResult?.accessToken || "";
+}
+
+async function createGoogleSheet({ title, headers, rows, shareWithEmail }) {
+  const accessToken = await getGoogleApiAccessToken();
+  if (!accessToken) {
+    const err = new Error("missing_google_api_token");
+    err.status = 500;
+    throw err;
+  }
+
+  const createRes = await fetch("https://sheets.googleapis.com/v4/spreadsheets", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      properties: { title },
+      sheets: [{ properties: { title: "Scoreboard Export" } }],
+    }),
+  });
+  if (!createRes.ok) {
+    const errText = await createRes.text().catch(() => "");
+    const err = new Error(`sheet_create_failed:${createRes.status}:${errText}`);
+    err.status = 500;
+    throw err;
+  }
+
+  const created = await createRes.json();
+  const spreadsheetId = normalizeText(created.spreadsheetId);
+  if (!spreadsheetId) {
+    const err = new Error("missing_spreadsheet_id");
+    err.status = 500;
+    throw err;
+  }
+
+  const valuesRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/A1:append?valueInputOption=RAW`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      majorDimension: "ROWS",
+      values: [headers, ...rows],
+    }),
+  });
+  if (!valuesRes.ok) {
+    const errText = await valuesRes.text().catch(() => "");
+    const err = new Error(`sheet_write_failed:${valuesRes.status}:${errText}`);
+    err.status = 500;
+    throw err;
+  }
+
+  if (shareWithEmail) {
+    const shareRes = await fetch(`https://www.googleapis.com/drive/v3/files/${spreadsheetId}/permissions?supportsAllDrives=true&sendNotificationEmail=false`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        role: "writer",
+        type: "user",
+        emailAddress: shareWithEmail,
+      }),
+    });
+    if (!shareRes.ok) {
+      const errText = await shareRes.text().catch(() => "");
+      console.warn("Scoreboard sheet share failed", errText);
+    }
+  }
+
+  return {
+    spreadsheetId,
+    url: `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+  };
+}
+
+async function invalidateScoreboardSnapshot(reason = "") {
+  scoreboardCache = {
+    builtAt: 0,
+    payload: null,
+    inFlight: null,
+  };
+  const metaRef = db.collection(COLLECTIONS.systemState).doc(SCOREBOARD_SNAPSHOT_DOC_ID);
+  await metaRef.set({
+    invalidatedAt: FieldValue.serverTimestamp(),
+    invalidationReason: normalizeText(reason),
+    builtAt: null,
+  }, { merge: true });
+}
+
+async function getScoreboardPayloadFromSnapshot({ forceRefresh = false } = {}) {
+  const now = Date.now();
+  if (!forceRefresh) {
+    try {
+      const snapshot = await readScoreboardSnapshot();
+      if (snapshot && (now - snapshot.builtAtMs) < SCOREBOARD_SNAPSHOT_TTL_MS) {
+        scoreboardCache.payload = snapshot.payload;
+        scoreboardCache.builtAt = snapshot.builtAtMs;
+        return {
+          payload: snapshot.payload,
+          source: "snapshot",
+          builtAtMs: snapshot.builtAtMs,
+        };
+      }
+    } catch (err) {
+      console.warn("Scoreboard snapshot read failed", err);
+    }
+  }
+
+  const payload = await getCachedScoreboardPayload();
+  try {
+    await writeScoreboardSnapshot(payload);
+  } catch (err) {
+    console.warn("Scoreboard snapshot write failed", err);
+  }
+  return {
+    payload,
+    source: "live",
+    builtAtMs: Date.now(),
+  };
+}
+
+function normalizeScoreboardType(value = "") {
+  const raw = normalizeKey(value);
+  if (raw === "fp" || raw === "fullpoems" || raw === "fullpoem") return "fp";
+  if (raw === "exc" || raw === "excerpts" || raw === "excerpt") return "exc";
+  if (raw === "qi" || raw === "quoteimages" || raw === "quoteimage") return "qi";
+  if (raw === "int" || raw === "interiorimages" || raw === "interiorimage") return "int";
+  if (raw === "gp" || raw === "graphics" || raw === "graphic") return "gp";
+  if (raw === "vv" || raw === "video" || raw === "videos") return "vv";
+  if (raw === "yt" || raw === "youtube" || raw === "youtubevideo" || raw === "youtubevideos") return "yt";
+  return raw;
+}
+
+function buildScoreboardFilterOptions(payload = {}) {
+  const allGraphics = Array.isArray(payload.allGraphics) ? payload.allGraphics : [];
+  const rawVotes = Array.isArray(payload.rawVotes) ? payload.rawVotes : [];
+  const uniqueSorted = (values) => Array.from(new Map(values
+    .map((value) => normalizeText(value))
+    .filter(Boolean)
+    .map((value) => [value.toLowerCase(), value])).values())
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  const booksByCatalog = {};
+  allGraphics.forEach((row) => {
+    const catalog = normalizeText(row.releaseCatalog).toLowerCase();
+    const book = normalizeText(row.bookTitle);
+    if (!catalog || !book) return;
+    if (!booksByCatalog[catalog]) booksByCatalog[catalog] = [];
+    booksByCatalog[catalog].push(book);
+  });
+  Object.keys(booksByCatalog).forEach((catalog) => {
+    booksByCatalog[catalog] = uniqueSorted(booksByCatalog[catalog]);
+  });
+  return {
+    users: uniqueSorted(rawVotes.map((row) => row.user)),
+    books: uniqueSorted(allGraphics.map((row) => row.bookTitle)),
+    catalogs: uniqueSorted(allGraphics.map((row) => row.releaseCatalog)),
+    booksByCatalog,
+    types: uniqueSorted(allGraphics.map((row) => row.type)),
+  };
+}
+
+function isAnonymousScoreboardUser(user = "") {
+  const normalized = normalizeText(user).toLowerCase();
+  return /^local-[a-z0-9]{6,}$/.test(normalized) || /^poetrylover\d+$/.test(normalized);
+}
+
+function applyScoreboardQuery(payload = {}, query = {}) {
+  const user = normalizeText(query.user).toLowerCase();
+  const type = normalizeScoreboardType(query.type);
+  const book = normalizeText(query.book).toLowerCase();
+  const catalog = normalizeText(query.catalog).toLowerCase();
+  const hideZero = normalizeText(query.hideZero) !== "false";
+  const charMin = query.charMin === undefined || query.charMin === "" ? null : Number(query.charMin);
+  const charMax = query.charMax === undefined || query.charMax === "" ? null : Number(query.charMax);
+  const source = user
+    ? (payload.rawVotes || []).filter((row) => (
+        user === "__anon_local__"
+          ? isAnonymousScoreboardUser(row.user)
+          : normalizeText(row.user).toLowerCase() === user
+      ))
+    : [...(payload.aggregated || [])];
+  let rows = source;
+  if (!user && hideZero) rows = rows.filter((row) => Number(row.totalVotes || 0) > 0);
+  if (type) rows = rows.filter((row) => normalizeScoreboardType(row.type) === type);
+  if (book) rows = rows.filter((row) => normalizeText(row.bookTitle).toLowerCase() === book);
+  if (catalog) rows = rows.filter((row) => normalizeText(row.releaseCatalog).toLowerCase() === catalog);
+  if ((type === "fp" || type === "exc") && (Number.isFinite(charMin) || Number.isFinite(charMax))) {
+    rows = rows.filter((row) => {
+      const count = Number(row.charCount || 0) || 0;
+      if (Number.isFinite(charMin) && count < charMin) return false;
+      if (Number.isFinite(charMax) && count > charMax) return false;
+      return true;
+    });
+  }
+  return rows;
+}
+
+function sortScoreboardRows(rows = [], sortKey = "bookTitle", sortDir = 1) {
+  const dir = Number(sortDir) < 0 ? -1 : 1;
+  const allowed = new Set(["imageId", "author", "poemTitle", "bookTitle", "type", "charCount", "likes", "dislikes", "meh", "movedMe", "totalVotes", "score", "scorePerVote", "movedMeRate", "vote"]);
+  const key = allowed.has(sortKey) ? sortKey : "bookTitle";
+  const readValue = (row) => {
+    if (key === "scorePerVote") {
+      const totalVotes = Number(row.totalVotes || 0);
+      return totalVotes ? Number(row.score || 0) / totalVotes : 0;
+    }
+    if (key === "movedMeRate") {
+      const totalVotes = Number(row.totalVotes || 0);
+      return totalVotes ? Number(row.movedMe || 0) / totalVotes : 0;
+    }
+    return row[key];
+  };
+  return [...rows].sort((a, b) => {
+    let va = readValue(a);
+    let vb = readValue(b);
+    if (typeof va === "string") va = va.toLowerCase();
+    if (typeof vb === "string") vb = vb.toLowerCase();
+    if (va > vb) return dir;
+    if (va < vb) return -dir;
+    return 0;
+  });
+}
+
+function resolveTeamProgressDateRange(query = {}, nowMs = Date.now()) {
+  const windowValue = normalizeKey(query.window || "all");
+  const parseDateStart = (value) => {
+    const raw = normalizeText(value);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+    const ms = new Date(`${raw}T00:00:00.000Z`).getTime();
+    return Number.isFinite(ms) ? ms : null;
+  };
+  const parseDateEnd = (value) => {
+    const raw = normalizeText(value);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+    const ms = new Date(`${raw}T23:59:59.999Z`).getTime();
+    return Number.isFinite(ms) ? ms : null;
+  };
+  if (windowValue === "today") {
+    const chicagoParts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/Chicago",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date(nowMs));
+    const part = (type) => chicagoParts.find((entry) => entry.type === type)?.value || "";
+    const start = new Date(`${part("year")}-${part("month")}-${part("day")}T00:00:00-05:00`).getTime();
+    return { startMs: start, endMs: nowMs, label: "Today" };
+  }
+  if (windowValue === "7d") return { startMs: nowMs - (7 * 24 * 60 * 60 * 1000), endMs: nowMs, label: "Last 7 days" };
+  if (windowValue === "30d") return { startMs: nowMs - (30 * 24 * 60 * 60 * 1000), endMs: nowMs, label: "Last 30 days" };
+  if (windowValue === "custom") {
+    return {
+      startMs: parseDateStart(query.startDate),
+      endMs: parseDateEnd(query.endDate),
+      label: "Custom",
+    };
+  }
+  return { startMs: null, endMs: null, label: "All time" };
+}
+
+function buildAdminTeamProgressPayload(payload = {}, query = {}) {
+  const dateRange = resolveTeamProgressDateRange(query);
+  const allGraphics = Array.isArray(payload.allGraphics) ? payload.allGraphics : [];
+  const rawVotes = Array.isArray(payload.rawVotes) ? payload.rawVotes : [];
+  const type = normalizeScoreboardType(query.type);
+  const book = normalizeText(query.book).toLowerCase();
+  const catalog = normalizeText(query.catalog).toLowerCase();
+  const availableById = new Map();
+  const totalsByBook = new Map();
+
+  allGraphics.forEach((item) => {
+    const imageId = normalizeText(item.imageId);
+    if (!imageId) return;
+    if (type && normalizeScoreboardType(item.type) !== type) return;
+    if (book && normalizeText(item.bookTitle).toLowerCase() !== book) return;
+    if (catalog && normalizeText(item.releaseCatalog).toLowerCase() !== catalog) return;
+    const detailKey = `${normalizeText(item.releaseCatalog).toLowerCase()}|${normalizeText(item.bookTitle).toLowerCase()}`;
+    availableById.set(imageId, {
+      imageId,
+      bookTitle: normalizeText(item.bookTitle),
+      releaseCatalog: normalizeText(item.releaseCatalog),
+      type: normalizeText(item.type),
+      detailKey,
+    });
+    if (!totalsByBook.has(detailKey)) {
+      totalsByBook.set(detailKey, {
+        key: detailKey,
+        bookTitle: normalizeText(item.bookTitle),
+        releaseCatalog: normalizeText(item.releaseCatalog),
+        availableCount: 0,
+      });
+    }
+    totalsByBook.get(detailKey).availableCount += 1;
+  });
+
+  const users = new Map();
+  rawVotes.forEach((vote) => {
+    const user = normalizeText(vote.user).toLowerCase();
+    const imageId = normalizeText(vote.imageId);
+    const time = Number(vote.time || 0);
+    if (!user.endsWith("@buttonpoetry.com")) return;
+    if (!availableById.has(imageId)) return;
+    if (dateRange.startMs && (!time || time < dateRange.startMs)) return;
+    if (dateRange.endMs && (!time || time > dateRange.endMs)) return;
+    if (!users.has(user)) {
+      users.set(user, {
+        user,
+        votedIds: new Set(),
+        totalVotes: 0,
+        details: new Map(),
+      });
+    }
+    const entry = users.get(user);
+    const item = availableById.get(imageId);
+    entry.votedIds.add(item.imageId);
+    entry.totalVotes += 1;
+    if (!entry.details.has(item.detailKey)) entry.details.set(item.detailKey, new Set());
+    entry.details.get(item.detailKey).add(item.imageId);
+  });
+
+  const availableCount = availableById.size;
+  const rows = Array.from(users.values()).map((entry) => {
+    const details = Array.from(totalsByBook.values()).map((totalRow) => {
+      const votedCount = entry.details.get(totalRow.key)?.size || 0;
+      return {
+        releaseCatalog: totalRow.releaseCatalog,
+        bookTitle: totalRow.bookTitle,
+        votedCount,
+        availableCount: totalRow.availableCount,
+        percent: totalRow.availableCount ? votedCount / totalRow.availableCount : 0,
+      };
+    }).sort((a, b) => (
+      a.releaseCatalog.toLowerCase().localeCompare(b.releaseCatalog.toLowerCase())
+      || a.bookTitle.toLowerCase().localeCompare(b.bookTitle.toLowerCase())
+    ));
+    return {
+      user: entry.user,
+      votedCount: entry.votedIds.size,
+      totalVotes: entry.totalVotes,
+      availableCount,
+      percent: availableCount ? entry.votedIds.size / availableCount : 0,
+      details,
+    };
+  }).sort((a, b) => (b.percent - a.percent) || (b.votedCount - a.votedCount) || a.user.localeCompare(b.user));
+
+  return {
+    ok: true,
+    rows,
+    availableCount,
+    filters: {
+      type: normalizeText(query.type),
+      book: normalizeText(query.book),
+      catalog: normalizeText(query.catalog),
+      window: normalizeText(query.window || "all"),
+      startDate: normalizeText(query.startDate),
+      endDate: normalizeText(query.endDate),
+    },
+    dateRange,
+    filterOptions: buildScoreboardFilterOptions(payload),
+  };
 }
 
 async function verifyIdTokenFromHeader(req) {
@@ -143,103 +3220,1761 @@ async function verifyIdTokenFromHeader(req) {
   }
 }
 
+function getApiKeyFromRequest(req) {
+  const headerKey = String(req.headers["x-api-key"] || "").trim();
+  if (headerKey) return headerKey;
+  const authHeader = String(req.headers.authorization || "");
+  const bearerMatch = authHeader.match(/^Bearer (.+)$/i);
+  const bearerValue = String(bearerMatch?.[1] || "").trim();
+  if (bearerValue && POETRY_PLEASE_API_KEYS.has(bearerValue)) {
+    return bearerValue;
+  }
+  const queryKey = String(req.query?.apiKey || "").trim();
+  return queryKey || null;
+}
+
+function hasValidPoetryPleaseApiKey(req) {
+  if (!POETRY_PLEASE_API_KEYS.size) return false;
+  const provided = getApiKeyFromRequest(req);
+  return !!provided && POETRY_PLEASE_API_KEYS.has(provided);
+}
+
+function normalizeText(value) {
+  return String(value || "").trim();
+}
+
+function buildExcerptFingerprint(value) {
+  return normalizeText(value)
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function normalizeMetricValue(value) {
+  const raw = normalizeText(value).replace(/,/g, "");
+  if (!raw) return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeKey(value) {
+  return normalizeText(value).toLowerCase();
+}
+
+function positiveResponseCountForSubmission(submission = {}) {
+  return Math.max(0, Number(submission.positiveResponseCount || 0) || 0);
+}
+
+function hasNewPositiveResponse(submission = {}) {
+  return positiveResponseCountForSubmission(submission) > (Number(submission.lastSeenPositiveResponseCount || 0) || 0);
+}
+
+async function recomputeSubmissionResponseSummary(submissionId) {
+  const snap = await db.collection(COLLECTIONS.submissionResponses)
+    .where("submissionId", "==", submissionId)
+    .limit(500)
+    .get();
+  let likeCount = 0;
+  let movedMeCount = 0;
+  let mehCount = 0;
+  let dislikeCount = 0;
+  snap.docs.forEach((doc) => {
+    const voteType = normalizeKey(doc.data()?.voteType);
+    if (voteType === "like") likeCount += 1;
+    else if (voteType === "movedme") movedMeCount += 1;
+    else if (voteType === "meh") mehCount += 1;
+    else if (voteType === "dislike") dislikeCount += 1;
+  });
+  const positiveResponseCount = likeCount + movedMeCount;
+  await db.collection(COLLECTIONS.contentSubmissions).doc(submissionId).set({
+    likeCount,
+    movedMeCount,
+    mehCount,
+    dislikeCount,
+    positiveResponseCount,
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+  return { likeCount, movedMeCount, mehCount, dislikeCount, positiveResponseCount };
+}
+
+function normalizeCatalogLookupKey(value) {
+  return normalizeText(value)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[’‘]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[–—]/g, "-")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildCatalogTitleLookupKeys(value) {
+  const raw = normalizeText(value);
+  if (!raw) return [];
+  const keys = [];
+  const pushKey = (candidate) => {
+    const key = normalizeCatalogLookupKey(candidate);
+    if (key && !keys.includes(key)) keys.push(key);
+    const compactKey = key.replace(/\s+/g, "");
+    if (compactKey && !keys.includes(compactKey)) keys.push(compactKey);
+  };
+  pushKey(raw);
+  [":", ",", " — ", " – ", " - "].forEach((separator) => {
+    if (raw.includes(separator)) {
+      pushKey(raw.split(separator, 1)[0]);
+    }
+  });
+  pushKey(raw.replace(/\s*\([^)]*\)\s*$/, ""));
+  return keys;
+}
+
+function lookupCatalogBookMetadata(book, author) {
+  const titleKeys = buildCatalogTitleLookupKeys(book);
+  const authorKey = normalizeCatalogLookupKey(author);
+  if (!titleKeys.length) return null;
+
+  if (authorKey) {
+    for (const titleKey of titleKeys) {
+      const direct = BOOK_CATALOG_LOOKUP.get(`${authorKey}|${titleKey}`);
+      if (direct) return direct;
+    }
+  }
+
+  for (const titleKey of titleKeys) {
+    const bucket = BOOK_CATALOG_TITLE_BUCKETS.get(titleKey) || [];
+    if (bucket.length === 1) return bucket[0];
+  }
+
+  return null;
+}
+
+function slugify(value) {
+  return normalizeText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+
+function extractYouTubeId(value) {
+  const raw = normalizeText(value);
+  if (!raw) return "";
+  const direct = raw.match(/^[A-Za-z0-9_-]{11}$/);
+  if (direct) return direct[0];
+  try {
+    const url = new URL(raw);
+    if (/(^|\.)youtu\.be$/i.test(url.hostname)) {
+      return normalizeText(url.pathname.replace(/^\/+/, "").split("/")[0]).slice(0, 32);
+    }
+    if (/youtube\.com$/i.test(url.hostname) || /(^|\.)youtube\.com$/i.test(url.hostname)) {
+      const v = normalizeText(url.searchParams.get("v"));
+      if (v) return v.slice(0, 32);
+      const parts = url.pathname.split("/").filter(Boolean);
+      const marker = parts.findIndex((part) => ["embed", "shorts", "live"].includes(part));
+      if (marker >= 0 && parts[marker + 1]) return normalizeText(parts[marker + 1]).slice(0, 32);
+    }
+  } catch (_err) {
+    return "";
+  }
+  return "";
+}
+
+function sanitizeDocIdSegment(value) {
+  // Firestore document IDs cannot contain path separators like "/".
+  return normalizeText(value)
+    .replace(/[\/]+/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function sha256(value) {
+  return createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+function uniq(values) {
+  return [...new Set((values || []).map(normalizeText).filter(Boolean))];
+}
+
+function resolveRoles(existingRoles = [], email = "", options = {}) {
+  const roles = new Set(
+    (Array.isArray(existingRoles) && existingRoles.length ? existingRoles : ["user"])
+      .map(normalizeText)
+      .filter(Boolean)
+  );
+  roles.add("user");
+  const normalizedEmail = normalizeKey(email);
+  const automaticTeamAccess = options.automaticTeamAccess !== false;
+  if (normalizedEmail.endsWith("@buttonpoetry.com")) {
+    if (automaticTeamAccess) roles.add("team");
+    else roles.delete("team");
+  }
+  if (ADMIN_EMAILS.has(normalizedEmail)) {
+    roles.add("admin");
+    roles.add("team");
+  }
+  return [...roles];
+}
+
+function sanitizeManagedRoles(inputRoles = [], email = "", options = {}) {
+  const allowed = new Set(["user", "author", "team", "admin"]);
+  const roles = (Array.isArray(inputRoles) ? inputRoles : [])
+    .map(normalizeText)
+    .filter((role) => allowed.has(role));
+  return resolveRoles(roles, email, options);
+}
+
+function mapProfileDoc(id, data = {}) {
+  return {
+    id,
+    userId: data.userId || "",
+    email: data.email || "",
+    displayName: data.displayName || "",
+    slug: data.slug || "",
+    bio: data.bio || "",
+    shortBio: data.shortBio || "",
+    photoUrl: data.photoUrl || "",
+    websiteUrl: data.websiteUrl || "",
+    instagramUrl: data.instagramUrl || "",
+    tiktokUrl: data.tiktokUrl || "",
+    youtubeUrl: data.youtubeUrl || "",
+    newsletterUrl: data.newsletterUrl || "",
+    bookstoreUrl: data.bookstoreUrl || "",
+    customLinks: Array.isArray(data.customLinks) ? data.customLinks : [],
+    authorNameVariants: uniq(data.authorNameVariants),
+    featuredContentIds: uniq(data.featuredContentIds),
+    claimedContentIds: uniq(data.claimedContentIds),
+    published: data.published !== false,
+    createdAt: data.createdAt || null,
+    updatedAt: data.updatedAt || null,
+  };
+}
+
+function mapAdminContentDoc(collection, doc) {
+  const data = doc.data() || {};
+  const contentId = data.imageId || data.imageID || data.videoId || doc.id;
+  return {
+    id: doc.id,
+    collection,
+    contentId,
+    imageType: data.imageType || "",
+    author: data.author || "",
+    title: data.title || data.poem || "",
+    poem: data.poem || "",
+    excerpt: data.excerpt || "",
+    book: data.book || "",
+    pageNumber: data.pageNumber || "",
+    url: data.url || "",
+    youtubeUrl: data.youtubeUrl || "",
+    thumbnailUrl: data.thumbnailUrl || "",
+    duration: data.duration || "",
+    channel: data.channel || "",
+    imageUrl: data.imageUrl || data.thumbnailUrl || data.url || "",
+    driveLink: data.driveLink || "",
+    bookLink: data.bookLink || "",
+    releaseCatalog: data.releaseCatalog || "",
+    sourceEvent: data.sourceEvent || "",
+    sourceEventLabel: data.sourceEventLabel || "",
+    releaseYear: data.releaseYear || "",
+    bookShortener: data.bookShortener || "",
+    updatedFileName: data.updatedFileName || "",
+    misc: data.misc || "",
+    createdAt: data.createdAt || null,
+    updatedAt: data.updatedAt || null,
+    updatedBy: data.updatedBy || "",
+  };
+}
+
+async function getAdminContentDocs(collection, { searchMode = false, imageType = "" } = {}) {
+  let query = db.collection(collection);
+  const normalizedImageType = normalizeText(imageType).toUpperCase();
+  if (normalizedImageType) {
+    query = query.where("imageType", "==", normalizedImageType);
+  }
+
+  if (!searchMode) {
+    const snap = await query.limit(250).get();
+    return snap.docs.map((doc) => mapAdminContentDoc(collection, doc));
+  }
+
+  const rows = [];
+  let page = await query.limit(1000).get();
+  while (!page.empty) {
+    rows.push(...page.docs.map((doc) => mapAdminContentDoc(collection, doc)));
+    const last = page.docs[page.docs.length - 1];
+    page = await query.startAfter(last).limit(1000).get();
+  }
+  return rows;
+}
+
+async function getAdminContentCount(collection, { imageType = "" } = {}) {
+  let query = db.collection(collection);
+  const normalizedImageType = normalizeText(imageType).toUpperCase();
+  if (normalizedImageType) {
+    query = query.where("imageType", "==", normalizedImageType);
+  }
+
+  const aggregate = await query.count().get();
+  return Number(aggregate.data().count || 0);
+}
+
+function deriveContentDocId(type, body = {}) {
+  if (type === "graphics") {
+    return normalizeText(body.docId || body.imageId);
+  }
+  if (type === "excerpts") {
+    const explicit = sanitizeDocIdSegment(body.docId || body.imageID || body.imageId);
+    if (explicit) return explicit;
+    const bookShortener = sanitizeDocIdSegment(body.bookShortener);
+    const poem = normalizeText(body.poem || body.title);
+    if (!bookShortener || !poem) return "";
+    return `${bookShortener}-EXC-${slugify(poem)}`.toUpperCase();
+  }
+  if (type === "full-poems" || type === "fullpoems") {
+    const explicit = sanitizeDocIdSegment(body.docId || body.contentId || body.imageId);
+    if (explicit) return explicit;
+    const bookShortener = sanitizeDocIdSegment(body.bookShortener);
+    const title = normalizeText(body.title);
+    if (!bookShortener || !title) return "";
+    return `${bookShortener}-FP-${slugify(title)}`.toUpperCase();
+  }
+  if (type === "videos") {
+    return normalizeText(body.docId || body.videoId || body.imageId);
+  }
+  if (type === "youtube") {
+    const explicit = sanitizeDocIdSegment(body.docId || body.videoId || body.imageId || body.contentId);
+    if (explicit) return explicit;
+    const youtubeId = sanitizeDocIdSegment(extractYouTubeId(body.youtubeUrl || body.url));
+    if (youtubeId) return `YT-${youtubeId}`.toUpperCase();
+    const shortener = sanitizeDocIdSegment(body.bookShortener);
+    const title = normalizeText(body.title);
+    if (!shortener || !title) return "";
+    return `${shortener}-YT-${slugify(title)}`.toUpperCase();
+  }
+  return "";
+}
+
+function buildContentDocPayload(type, body = {}, options = {}) {
+  const now = FieldValue.serverTimestamp();
+  const docId = deriveContentDocId(type, body);
+  if (!docId) {
+    const err = new Error("missing_content_id");
+    err.status = 400;
+    throw err;
+  }
+
+  const imageType = normalizeText(body.imageType || (type === "excerpts" ? "EXC" : (type === "full-poems" || type === "fullpoems") ? "FP" : type === "videos" ? "VV" : type === "youtube" ? "YT" : ""));
+  const payload = {
+    imageType,
+    contentId: docId,
+    author: normalizeText(body.author),
+    book: normalizeText(body.book),
+    driveLink: normalizeText(body.driveLink),
+    bookLink: normalizeText(body.bookLink),
+    releaseCatalog: normalizeText(body.releaseCatalog),
+    sourceEvent: normalizeText(body.sourceEvent),
+    sourceEventLabel: normalizeText(body.sourceEventLabel),
+    updatedAt: now,
+    updatedBy: normalizeText(options.updatedBy || ""),
+  };
+  const sourceSystem = normalizeText(body.sourceSystem);
+  const sourceRecordId = normalizeText(body.sourceRecordId);
+  if (sourceSystem) payload.sourceSystem = sourceSystem;
+  if (sourceRecordId) payload.sourceRecordId = sourceRecordId;
+  if (normalizeText(body.excerptHash)) payload.excerptHash = normalizeText(body.excerptHash);
+  if (normalizeText(body.normalizedExcerpt)) payload.normalizedExcerpt = normalizeText(body.normalizedExcerpt);
+  if (normalizeText(body.sourceUrl)) payload.sourceUrl = normalizeText(body.sourceUrl);
+  if (normalizeText(body.approvedAt)) payload.approvedAt = normalizeText(body.approvedAt);
+  if (normalizeText(body.sourceUpdatedAt || body.updatedAt)) payload.sourceUpdatedAt = normalizeText(body.sourceUpdatedAt || body.updatedAt);
+  if (normalizeText(body.sourceContentId)) payload.sourceContentId = normalizeText(body.sourceContentId);
+
+  if (type === "graphics") {
+    payload.title = normalizeText(body.title);
+    payload.imageId = docId;
+    payload.imageUrl = normalizeText(options.imageUrl || body.imageUrl);
+    payload.misc = normalizeText(body.misc);
+    if (normalizeText(body.pageNumber)) payload.pageNumber = normalizeText(body.pageNumber);
+    if (normalizeText(body.bookShortener)) payload.bookShortener = normalizeText(body.bookShortener);
+    if (normalizeText(body.ocrText)) payload.ocrText = normalizeText(body.ocrText);
+    if (normalizeText(body.reviewStatus)) payload.reviewStatus = normalizeText(body.reviewStatus);
+  } else if (type === "excerpts") {
+    payload.poem = normalizeText(body.poem || body.title);
+    payload.excerpt = normalizeText(body.excerpt);
+    payload.excerptFingerprint = buildExcerptFingerprint(body.excerpt);
+    payload.pageNumber = normalizeText(body.pageNumber);
+    payload.bookShortener = normalizeText(body.bookShortener);
+    payload.imageID = docId;
+    payload.imageId = docId;
+  } else if (type === "full-poems" || type === "fullpoems") {
+    payload.title = normalizeText(body.title);
+    payload.excerpt = normalizeText(body.excerpt);
+    payload.pageNumber = normalizeText(body.pageNumber);
+    payload.bookShortener = normalizeText(body.bookShortener);
+    payload.releaseYear = normalizeText(body.releaseYear);
+    payload.imageId = docId;
+    payload.imageID = docId;
+    payload.imageUrl = normalizeText(body.imageUrl);
+    payload.videoUrl = normalizeText(body.videoUrl);
+    payload.url = normalizeText(body.url);
+  } else if (type === "videos") {
+    payload.title = normalizeText(body.title);
+    payload.videoId = docId;
+    payload.url = normalizeText(options.mediaUrl || body.videoUrl || body.url || body.imageUrl);
+    payload.videoUrl = normalizeText(options.mediaUrl || body.videoUrl || body.url || body.imageUrl);
+    payload.imageUrl = normalizeText(options.imageUrl || body.imageUrl);
+    payload.releaseYear = normalizeText(body.releaseYear);
+    payload.bookShortener = normalizeText(body.bookShortener);
+    payload.updatedFileName = normalizeText(body.updatedFileName);
+    payload.pageNumber = normalizeText(body.pageNumber);
+    payload.misc = normalizeText(body.misc);
+  } else if (type === "youtube") {
+    const youtubeUrl = normalizeText(body.youtubeUrl || body.url);
+    const youtubeId = normalizeText(body.youtubeId || extractYouTubeId(youtubeUrl));
+    payload.title = normalizeText(body.title);
+    payload.videoId = docId;
+    payload.url = youtubeUrl;
+    payload.youtubeUrl = youtubeUrl;
+    payload.youtubeId = youtubeId;
+    payload.thumbnailUrl = normalizeText(body.thumbnailUrl || body.imageUrl);
+    payload.imageUrl = normalizeText(body.thumbnailUrl || body.imageUrl);
+    payload.releaseYear = normalizeText(body.releaseYear);
+    payload.bookShortener = normalizeText(body.bookShortener);
+    payload.updatedFileName = normalizeText(body.updatedFileName);
+    payload.pageNumber = normalizeText(body.pageNumber);
+    payload.misc = normalizeText(body.misc);
+    payload.duration = normalizeText(body.duration);
+    payload.channel = normalizeText(body.channel);
+    payload.uploadTime = normalizeText(body.uploadTime);
+    payload.socialViews = normalizeMetricValue(body.socialViews ?? body.views);
+    payload.socialLikes = normalizeMetricValue(body.socialLikes ?? body.likes);
+    payload.socialComments = normalizeMetricValue(body.socialComments ?? body.comments);
+    payload.socialDislikes = normalizeMetricValue(body.socialDislikes ?? body.dislikes);
+    payload.socialSyncSource = normalizeText(body.socialSyncSource || "youtube_export");
+    payload.socialLastSyncedAt = normalizeText(body.socialLastSyncedAt || body.syncTime);
+  } else {
+    const err = new Error("invalid_content_type");
+    err.status = 400;
+    throw err;
+  }
+
+  return { docId, payload };
+}
+
+function collectionForContentType(type) {
+  const normalized = normalizeKey(type);
+  if (normalized === "graphics") return COLLECTIONS.graphics;
+  if (normalized === "excerpts") return COLLECTIONS.excerpts;
+  if (normalized === "fullpoems" || normalized === "full-poems") return COLLECTIONS.fullPoems;
+  if (normalized === "videos") return COLLECTIONS.videos;
+  if (normalized === "youtube") return COLLECTIONS.videos;
+  return "";
+}
+
+async function resolveContentRefForDelete(collection, requestedId, type) {
+  const directRef = db.collection(collection).doc(requestedId);
+  const directSnap = await directRef.get();
+  const matchesType = (snap) => !(type === "youtube" && normalizeKey(snap.data()?.imageType) !== "yt");
+
+  if (directSnap.exists && matchesType(directSnap)) {
+    return { ref: directRef, snap: directSnap };
+  }
+
+  const fallbackFields = ["contentId", "imageId"];
+  for (const field of fallbackFields) {
+    const querySnap = await db.collection(collection).where(field, "==", requestedId).limit(1).get();
+    const hit = querySnap.docs.find((doc) => matchesType(doc));
+    if (hit) {
+      return { ref: hit.ref, snap: hit };
+    }
+  }
+
+  return null;
+}
+
+async function upsertContentLibraryItem(type, body = {}, actor = {}) {
+  const collection = collectionForContentType(type);
+  if (!collection) {
+    const err = new Error("invalid_content_type");
+    err.status = 400;
+    throw err;
+  }
+
+  const pendingDocId = deriveContentDocId(type, body);
+  if (!pendingDocId) {
+    const err = new Error("missing_content_id");
+    err.status = 400;
+    throw err;
+  }
+
+  const originalDocId = sanitizeDocIdSegment(body.originalDocId || body.originalContentId || body.previousDocId || "");
+  const isRename = !!originalDocId && originalDocId !== pendingDocId;
+  const ref = db.collection(collection).doc(pendingDocId);
+  const snap = await ref.get();
+  const originalRef = isRename ? db.collection(collection).doc(originalDocId) : null;
+  const originalSnap = originalRef ? await originalRef.get() : null;
+  if (isRename && snap.exists) {
+    const err = new Error("content_id_already_exists");
+    err.status = 409;
+    throw err;
+  }
+  const sourceSnap = isRename && originalSnap?.exists ? originalSnap : snap;
+  const existing = sourceSnap.exists ? (sourceSnap.data() || {}) : {};
+
+  let uploadImageUrl = "";
+  if (normalizeKey(type) === "graphics" && normalizeText(body?.base64Data)) {
+    const upload = parseBase64Upload(body, UPLOAD_RULES.replacementImage);
+    const storagePath = `content-library/graphics/${normalizeKey(pendingDocId)}/${Date.now()}.${upload.extension}`;
+    const { publicUrl } = await saveImageUpload({
+      storagePath,
+      mimeType: upload.mimeType,
+      buffer: upload.buffer,
+    });
+    uploadImageUrl = publicUrl;
+
+    const assetRef = db.collection(COLLECTIONS.contentAssets).doc();
+    await assetRef.set({
+      assetType: "library_graphic",
+      imageId: pendingDocId,
+      contentCollection: collection,
+      contentDocId: pendingDocId,
+      storagePath,
+      publicUrl,
+      width: upload.width,
+      height: upload.height,
+      fileSize: upload.fileSize,
+      mimeType: upload.mimeType,
+      uploadedByUid: actor.uid || "",
+      uploadedByEmail: actor.email || "",
+      status: "active",
+      createdAt: FieldValue.serverTimestamp(),
+    });
+  }
+  if (normalizeKey(type) === "graphics" && !uploadImageUrl) {
+    const sourceUrl = normalizeText(body?.driveLink || body?.assetLinkUrl || body?.imageUrl || body?.url);
+    const currentImageUrl = normalizeText(existing.imageUrl || "");
+    const preserveProvidedImageUrl = normalizeKey(body?.remoteIngestMode) === "preserve_image_url"
+      && !!normalizeText(body?.imageUrl)
+      && !isGoogleDriveFileUrl(body.imageUrl);
+    const shouldIngestRemoteGraphic = !!sourceUrl
+      && !preserveProvidedImageUrl
+      && (!currentImageUrl || isGoogleDriveFileUrl(currentImageUrl));
+    if (shouldIngestRemoteGraphic) {
+      const remoteUpload = await fetchRemoteMediaResponse(sourceUrl, UPLOAD_RULES.libraryGraphic, body);
+      const storagePath = `content-library/graphics/${normalizeKey(pendingDocId)}/${Date.now()}.${remoteUpload.extension}`;
+      const streamedUpload = await streamRemoteMediaToStorage({
+        sourceUrl,
+        storagePath,
+        rules: UPLOAD_RULES.libraryGraphic,
+        body,
+        remoteMedia: remoteUpload,
+      });
+      uploadImageUrl = streamedUpload.publicUrl;
+
+      const assetRef = db.collection(COLLECTIONS.contentAssets).doc();
+      await assetRef.set({
+        assetType: "library_graphic",
+        imageId: pendingDocId,
+        contentCollection: collection,
+        contentDocId: pendingDocId,
+        storagePath: streamedUpload.storagePath,
+        publicUrl: streamedUpload.publicUrl,
+        fileSize: streamedUpload.fileSize,
+        mimeType: streamedUpload.mimeType,
+        originalFileName: streamedUpload.fileName,
+        sourceUrl,
+        sourceFinalUrl: streamedUpload.finalUrl,
+        uploadedByUid: actor.uid || "",
+        uploadedByEmail: actor.email || "",
+        status: "active",
+        createdAt: FieldValue.serverTimestamp(),
+      });
+    }
+  }
+
+  let uploadMediaUrl = normalizeText(existing.videoUrl || existing.url);
+  if (normalizeKey(type) === "videos" && normalizeText(body?.imageType || "VV").toUpperCase() !== "YT") {
+    const requestedMode = normalizeKey(body?.storageMode || body?.mediaStorageMode || "");
+    const shouldIngestRemoteMedia = requestedMode !== "external";
+    const sourceUrl = normalizeText(body?.driveLink || body?.url || body?.videoUrl);
+    const needsHostedMedia = !normalizeText(body?.videoUrl) && (!uploadMediaUrl || isGoogleDriveFileUrl(uploadMediaUrl));
+    if (shouldIngestRemoteMedia && sourceUrl && needsHostedMedia) {
+      const remoteUpload = await fetchRemoteMediaResponse(sourceUrl, UPLOAD_RULES.libraryVideo, body);
+      const storagePath = `content-library/videos/${normalizeKey(pendingDocId)}/${Date.now()}.${remoteUpload.extension}`;
+      const streamedUpload = await streamRemoteMediaToStorage({
+        sourceUrl,
+        storagePath,
+        rules: UPLOAD_RULES.libraryVideo,
+        body,
+        remoteMedia: remoteUpload,
+      });
+      uploadMediaUrl = streamedUpload.publicUrl;
+
+      const assetRef = db.collection(COLLECTIONS.contentAssets).doc();
+      await assetRef.set({
+        assetType: "library_video",
+        imageId: pendingDocId,
+        contentCollection: collection,
+        contentDocId: pendingDocId,
+        storagePath: streamedUpload.storagePath,
+        publicUrl: streamedUpload.publicUrl,
+        fileSize: streamedUpload.fileSize,
+        mimeType: streamedUpload.mimeType,
+        originalFileName: streamedUpload.fileName,
+        sourceUrl,
+        sourceFinalUrl: streamedUpload.finalUrl,
+        uploadedByUid: actor.uid || "",
+        uploadedByEmail: actor.email || "",
+        status: "active",
+        createdAt: FieldValue.serverTimestamp(),
+      });
+    }
+  }
+
+  const existingImageUrl = normalizeText(existing.imageUrl || "");
+  const shouldPreserveHostedGraphicUrl = normalizeKey(type) === "graphics"
+    && !uploadImageUrl
+    && !!existingImageUrl
+    && !isGoogleDriveFileUrl(existingImageUrl);
+  const imageUrlForPayload = shouldPreserveHostedGraphicUrl
+    ? existingImageUrl
+    : normalizeText(uploadImageUrl || body.imageUrl);
+
+  const built = buildContentDocPayload(type, body, {
+    imageUrl: imageUrlForPayload,
+    mediaUrl: uploadMediaUrl,
+    updatedBy: actor.uid || "",
+  });
+  if (normalizeKey(type) === "excerpts" && built.payload.excerptFingerprint) {
+    const allowedExistingIds = new Set([pendingDocId, originalDocId].filter(Boolean));
+    let duplicateSnap = await db.collection(COLLECTIONS.excerpts)
+      .where("excerptFingerprint", "==", built.payload.excerptFingerprint)
+      .limit(2)
+      .get();
+    let duplicateDoc = duplicateSnap.docs.find((doc) => !allowedExistingIds.has(doc.id));
+
+    // Legacy EXC rows predate excerptFingerprint. Keep writes safe until an admin scan backfills them.
+    if (!duplicateDoc) {
+      duplicateSnap = await db.collection(COLLECTIONS.excerpts).get();
+      duplicateDoc = duplicateSnap.docs.find((doc) => (
+        !allowedExistingIds.has(doc.id)
+        && buildExcerptFingerprint(doc.data()?.excerpt) === built.payload.excerptFingerprint
+      ));
+    }
+
+    if (duplicateDoc) {
+      const primary = { id: duplicateDoc.id, ...(duplicateDoc.data() || {}) };
+      await createContentDuplicateForItem({
+        ...built.payload,
+        imageId: pendingDocId,
+        title: built.payload.poem,
+      }, {
+        imageId: primary.imageId || primary.imageID || primary.id,
+        title: primary.poem || primary.title || "",
+        author: primary.author || "",
+        book: primary.book || "",
+        driveLink: primary.driveLink || "",
+      }, actor, {
+        duplicateMatchType: "exactExcerptText",
+        duplicateFingerprint: built.payload.excerptFingerprint,
+        note: "Blocked before write because another EXC has the same normalized excerpt text.",
+        source: "content_write_guardrail",
+      });
+      const err = new Error("duplicate_excerpt_text");
+      err.status = 409;
+      err.duplicateOfImageId = primary.imageId || primary.imageID || primary.id;
+      throw err;
+    }
+  }
+  await ref.set({
+    ...existing,
+    ...built.payload,
+    createdAt: existing.createdAt || FieldValue.serverTimestamp(),
+  }, { merge: true });
+  if (isRename && originalSnap?.exists) {
+    await originalRef.delete();
+  }
+
+  const saved = await ref.get();
+  return {
+    ok: true,
+    item: mapAdminContentDoc(collection, saved),
+    created: !sourceSnap.exists,
+    renamed: isRename && originalSnap?.exists,
+  };
+}
+
+async function previewContentLibraryItem(type, body = {}) {
+  const collection = collectionForContentType(type);
+  if (!collection) {
+    const err = new Error("invalid_content_type");
+    err.status = 400;
+    throw err;
+  }
+
+  const built = buildContentDocPayload(type, body, {});
+  const ref = db.collection(collection).doc(built.docId);
+  const snap = await ref.get();
+  return {
+    ok: true,
+    id: built.docId,
+    collection,
+    action: snap.exists ? "update" : "create",
+    title: normalizeText(body.title || body.poem || ""),
+    author: normalizeText(body.author),
+    imageType: normalizeText(body.imageType || built.payload.imageType || ""),
+  };
+}
+
+function importAssistantGraphicSourceKey(item = {}) {
+  const candidates = [
+    item.driveLink,
+    item.assetLinkUrl,
+    item.sourceUrl,
+    item.imageUrl,
+    item.url,
+  ].map(normalizeText).filter(Boolean);
+  for (const candidate of candidates) {
+    const driveId = extractGoogleDriveFileId(candidate);
+    if (driveId) return `drive:${driveId}`;
+  }
+  return candidates[0] ? `url:${normalizeKey(candidates[0])}` : "";
+}
+
+function importAssistantGraphicSourcesMatch(existing = {}, incoming = {}) {
+  const existingKeys = [
+    existing.driveLink,
+    existing.sourceUrl,
+    existing.assetLinkUrl,
+    existing.imageUrl,
+    existing.url,
+  ].map((value) => importAssistantGraphicSourceKey({ driveLink: value })).filter(Boolean);
+  const incomingKey = importAssistantGraphicSourceKey(incoming);
+  return !!incomingKey && existingKeys.includes(incomingKey);
+}
+
+function importAssistantGraphicMetadataKey(item = {}) {
+  return importGraphicMetadataKey(item);
+}
+
+function applyImportAssistantGraphicMatch(row, existing, reason) {
+  const item = row.contentItem || {};
+  const canonicalId = sanitizeDocIdSegment(existing.contentId || existing.imageId || existing.id || "");
+  return {
+    row: finalizeImportAssistantGraphicRow({
+      ...row,
+      matchReason: reason,
+      canonicalExistingId: canonicalId,
+      suggestedDocId: canonicalId,
+      contentItem: {
+        ...item,
+        docId: canonicalId,
+        imageId: canonicalId,
+      },
+    }),
+    action: "update",
+  };
+}
+
+async function assignImportAssistantGraphicDocId(row = {}, usedIds = new Set(), existingGraphics = []) {
+  const item = row.contentItem || {};
+  const baseId = sanitizeDocIdSegment(item.docId || row.suggestedDocId || "");
+  if (!baseId) return { row, action: "error" };
+
+  const baseKey = normalizeKey(baseId);
+  if (usedIds.has(baseKey)) {
+    return { row, action: "error", error: "duplicate_id_in_batch" };
+  }
+
+  const exactMatches = existingGraphics.filter((existing) => {
+    return normalizeKey(existing.contentId || existing.imageId || existing.id || "") === baseKey;
+  });
+  const sourceMatches = existingGraphics.filter((existing) => {
+    return importAssistantGraphicSourcesMatch(existing, item);
+  });
+  const metadataKey = importAssistantGraphicMetadataKey(item);
+  const metadataMatches = metadataKey
+    ? existingGraphics.filter((existing) => importAssistantGraphicMetadataKey(existing) === metadataKey)
+    : [];
+
+  const uniqueById = (rows) => {
+    const seen = new Set();
+    return rows.filter((existing) => {
+      const key = normalizeKey(existing.contentId || existing.imageId || existing.id || "");
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+  const sourceCandidates = uniqueById(sourceMatches);
+  const metadataCandidates = uniqueById(metadataMatches);
+
+  if (exactMatches.length === 1) {
+    const exactMatch = exactMatches[0];
+    const exactMatchConfirmed = !!normalizeText(row.suppliedDocId)
+      || importAssistantGraphicSourcesMatch(exactMatch, item)
+      || (
+        !!metadataKey &&
+        importAssistantGraphicMetadataKey(exactMatch) === metadataKey
+      );
+    if (exactMatchConfirmed) {
+      usedIds.add(baseKey);
+      return applyImportAssistantGraphicMatch(row, exactMatch, "exact_id");
+    }
+    return {
+      row: {
+        ...row,
+        alternateMatches: [{
+          id: exactMatch.contentId || exactMatch.imageId || exactMatch.id || "",
+          author: exactMatch.author || "",
+          book: exactMatch.book || "",
+          title: exactMatch.title || exactMatch.poem || "",
+          matchReason: "id_collision",
+        }],
+      },
+      action: "review",
+      error: "id_collision_review_required",
+    };
+  }
+  if (exactMatches.length > 1) {
+    return { row, action: "review", error: "ambiguous_exact_id" };
+  }
+  if (sourceCandidates.length === 1) {
+    const matched = applyImportAssistantGraphicMatch(row, sourceCandidates[0], "source_asset");
+    usedIds.add(normalizeKey(matched.row.suggestedDocId));
+    return matched;
+  }
+  if (metadataCandidates.length === 1) {
+    const matched = applyImportAssistantGraphicMatch(row, metadataCandidates[0], "author_book_title");
+    usedIds.add(normalizeKey(matched.row.suggestedDocId));
+    return matched;
+  }
+
+  const ambiguousCandidates = uniqueById([...sourceCandidates, ...metadataCandidates]);
+  if (ambiguousCandidates.length > 1) {
+    return {
+      row: {
+        ...row,
+        alternateMatches: ambiguousCandidates.slice(0, 10).map((existing) => ({
+          id: existing.contentId || existing.imageId || existing.id || "",
+          author: existing.author || "",
+          book: existing.book || "",
+          title: existing.title || existing.poem || "",
+          matchReason: sourceCandidates.includes(existing) ? "source_asset" : "author_book_title",
+        })),
+      },
+      action: "review",
+      error: "ambiguous_existing_matches",
+    };
+  }
+  usedIds.add(baseKey);
+  return {
+    row: finalizeImportAssistantGraphicRow({
+      ...row,
+      suggestedDocId: baseId,
+      contentItem: {
+        ...item,
+        docId: baseId,
+        imageId: baseId,
+      },
+    }),
+    action: "create",
+  };
+}
+
+function pickProfileContent(profile, allContent, ratings) {
+  const authorKeys = new Set(
+    uniq([profile.displayName, ...(profile.authorNameVariants || [])]).map(normalizeKey)
+  );
+  const claimedKeys = new Set((profile.claimedContentIds || []).map(normalizeKey));
+  const authored = allContent.filter((item) => authorKeys.has(normalizeKey(item.author)) || claimedKeys.has(normalizeKey(item.imageId)));
+  const byId = new Map(authored.map((item) => [normalizeKey(item.imageId), item]));
+  const featured = (profile.featuredContentIds || [])
+    .map((id) => byId.get(normalizeKey(id)))
+    .filter(Boolean);
+
+  const fallback = authored
+    .slice()
+    .sort((a, b) => {
+      const ra = ratings[a.imageId] || { rating: -Infinity, total: 0 };
+      const rb = ratings[b.imageId] || { rating: -Infinity, total: 0 };
+      if (rb.rating !== ra.rating) return rb.rating - ra.rating;
+      if (rb.total !== ra.total) return rb.total - ra.total;
+      return a.title.localeCompare(b.title);
+    })
+    .slice(0, 12);
+
+  return {
+    authored,
+    featured: featured.length ? featured : fallback,
+  };
+}
+
+async function getUserRecord(uid) {
+  const snap = await db.collection(COLLECTIONS.users).doc(uid).get();
+  return snap.exists ? snap.data() || {} : null;
+}
+
+async function ensureUserRecord(decoded) {
+  const ref = db.collection(COLLECTIONS.users).doc(decoded.uid);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    const payload = {
+      email: decoded.email || "",
+      displayName: decoded.name || decoded.email || "",
+      roles: resolveRoles([], decoded.email),
+      automaticTeamAccess: normalizeKey(decoded.email).endsWith("@buttonpoetry.com"),
+      createdAt: FieldValue.serverTimestamp(),
+      lastLoginAt: FieldValue.serverTimestamp(),
+      status: "active",
+    };
+    await ref.set(payload, { merge: true });
+    const saved = await ref.get();
+    return saved.data() || payload;
+  }
+  const existing = snap.data() || {};
+  await ref.set(
+    {
+      email: decoded.email || existing.email || "",
+      displayName: decoded.name || existing.displayName || decoded.email || "",
+      lastLoginAt: FieldValue.serverTimestamp(),
+      status: existing.status || "active",
+      roles: resolveRoles(existing.roles, decoded.email || existing.email || "", {
+        automaticTeamAccess: existing.automaticTeamAccess !== false,
+      }),
+    },
+    { merge: true }
+  );
+  const saved = await ref.get();
+  return saved.data() || existing;
+}
+
+async function syncUserRecordFromAuthUser(authUser) {
+  const ref = db.collection(COLLECTIONS.users).doc(authUser.uid);
+  const snap = await ref.get();
+  const existing = snap.exists ? (snap.data() || {}) : {};
+  const payload = {
+    email: authUser.email || existing.email || "",
+    displayName: authUser.displayName || existing.displayName || authUser.email || authUser.uid,
+    status: authUser.disabled ? "disabled" : (existing.status || "active"),
+    roles: resolveRoles(existing.roles, authUser.email || existing.email || "", {
+      automaticTeamAccess: existing.automaticTeamAccess !== false,
+    }),
+    automaticTeamAccess: existing.automaticTeamAccess !== false,
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+  if (!snap.exists) payload.createdAt = FieldValue.serverTimestamp();
+  await ref.set(payload, { merge: true });
+  const saved = await ref.get();
+  return { uid: authUser.uid, ...(saved.data() || payload) };
+}
+
+async function listAllAuthUsers(limit = 1000) {
+  const users = [];
+  let pageToken;
+  do {
+    const batchSize = Math.min(1000, limit - users.length);
+    if (batchSize <= 0) break;
+    const page = await auth.listUsers(batchSize, pageToken);
+    users.push(...page.users);
+    pageToken = page.pageToken;
+  } while (pageToken && users.length < limit);
+  return users;
+}
+
+
+async function getVoteCountsByUserId() {
+  const counts = new Map();
+  let page = await db.collection(COLLECTIONS.votes).limit(1000).get();
+  while (!page.empty) {
+    page.forEach((doc) => {
+      const data = doc.data() || {};
+      const key = normalizeKey(data.userId || "");
+      if (!key) return;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    });
+    const last = page.docs[page.docs.length - 1];
+    page = await db.collection(COLLECTIONS.votes).startAfter(last).limit(1000).get();
+  }
+  return counts;
+}
+
+async function getVoteStatsByUserId() {
+  const stats = new Map();
+  let page = await db.collection(COLLECTIONS.votes).limit(1000).get();
+  while (!page.empty) {
+    page.forEach((doc) => {
+      const data = doc.data() || {};
+      const key = normalizeKey(data.userId || "");
+      if (!key) return;
+      const current = stats.get(key) || { count: 0, lastActivityAt: null };
+      current.count += 1;
+      const ts = data.timestamp || null;
+      const currentSeconds = current.lastActivityAt?._seconds || 0;
+      const nextSeconds = ts?._seconds || 0;
+      if (nextSeconds > currentSeconds) current.lastActivityAt = ts;
+      stats.set(key, current);
+    });
+    const last = page.docs[page.docs.length - 1];
+    page = await db.collection(COLLECTIONS.votes).startAfter(last).limit(1000).get();
+  }
+  return stats;
+}
+
+
+async function getFlaggedContentIds() {
+  const now = Date.now();
+  if (flaggedContentCache.payload && (now - flaggedContentCache.builtAt) < FLAGGED_CONTENT_CACHE_TTL_MS) {
+    return new Set(flaggedContentCache.payload);
+  }
+  if (flaggedContentCache.inFlight) return flaggedContentCache.inFlight;
+  flaggedContentCache.inFlight = buildFlaggedContentIds().finally(() => {
+    flaggedContentCache.inFlight = null;
+  });
+  return flaggedContentCache.inFlight;
+}
+
+async function buildFlaggedContentIds() {
+  const ids = new Set();
+  let page = await db.collection(COLLECTIONS.contentFlags).where("status", "==", "pending").limit(1000).get();
+  while (!page.empty) {
+    page.forEach((doc) => {
+      const data = doc.data() || {};
+      const imageId = normalizeKey(data.imageId || "");
+      if (imageId) ids.add(imageId);
+    });
+    const last = page.docs[page.docs.length - 1];
+    page = await db.collection(COLLECTIONS.contentFlags).where("status", "==", "pending").startAfter(last).limit(1000).get();
+  }
+  const authorVoteUserIds = await getAuthorVoteUserIds();
+  if (authorVoteUserIds.size) {
+    const latestAuthorVotes = new Map();
+    let votePage = await db.collection(COLLECTIONS.votes).limit(1000).get();
+    while (!votePage.empty) {
+      votePage.forEach((doc) => {
+        const data = doc.data() || {};
+        const userId = normalizeKey(data.userId || "");
+        const imageId = normalizeKey(data.imageId || "");
+        if (!authorVoteUserIds.has(userId) || !imageId) return;
+        const key = `${userId}|${imageId}`;
+        const time = timestampToMs(data.timestamp);
+        const current = latestAuthorVotes.get(key);
+        if (!current || time >= current.time) {
+          latestAuthorVotes.set(key, {
+            imageId,
+            voteType: normalizeKey(data.voteType || ""),
+            time,
+          });
+        }
+      });
+      const last = votePage.docs[votePage.docs.length - 1];
+      votePage = await db.collection(COLLECTIONS.votes).startAfter(last).limit(1000).get();
+    }
+    latestAuthorVotes.forEach((vote) => {
+      if (vote.voteType === "dislike") ids.add(vote.imageId);
+    });
+  }
+  flaggedContentCache.payload = [...ids];
+  flaggedContentCache.builtAt = Date.now();
+  return new Set(ids);
+}
+
+function invalidateFlaggedContentCache() {
+  flaggedContentCache.builtAt = 0;
+  flaggedContentCache.payload = null;
+  flaggedContentCache.inFlight = null;
+}
+
+function excludeFlaggedContent(items, flaggedIds) {
+  return (items || []).filter((item) => !flaggedIds.has(normalizeKey(item.imageId || item.id || "")));
+}
+
+async function requireDecodedUser(req, res) {
+  const decoded = await verifyIdTokenFromHeader(req);
+  if (!decoded?.uid || !decoded?.email) {
+    res.status(401).json({ error: "auth" });
+    return null;
+  }
+  const userRecord = await ensureUserRecord(decoded);
+  return { decoded, userRecord };
+}
+
+async function requireRole(req, res, roles) {
+  const ctx = await requireDecodedUser(req, res);
+  if (!ctx) return null;
+  const currentRoles = Array.isArray(ctx.userRecord?.roles) ? ctx.userRecord.roles : [];
+  if (!roles.some((role) => currentRoles.includes(role))) {
+    res.status(403).json({ error: "forbidden", requiredRoles: roles });
+    return null;
+  }
+  return ctx;
+}
+
+async function requirePigReadAccess(req, res) {
+  if (hasValidPoetryPleaseApiKey(req)) {
+    return {
+      machine: true,
+      userRecord: {
+        roles: ["team"],
+        email: "machine:pig",
+      },
+    };
+  }
+  return requireRole(req, res, ["team", "admin"]);
+}
+
 /** ====== ROOT + HEALTH ====== */
 app.get("/", (_req, res) => {
   res.type("text/plain").send("Poetry Please API is alive ✅  Try /imageTypes etc.");
 });
-app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 /** ====== ROUTE REGISTRATION (supports both with and without /api) ====== */
 const getBoth = (p) => [p, `/api${p}`];
 
+app.get(getBoth("/healthz"), (_req, res) => res.json({ ok: true }));
+app.get(getBoth("/buildInfo"), (_req, res) => {
+  res.json({
+    repo: "samvancook/poetry-please",
+    commitSha: normalizeText(process.env.PP_COMMIT_SHA || ""),
+    branch: normalizeText(process.env.PP_BRANCH || ""),
+    deployedAt: normalizeText(process.env.PP_DEPLOYED_AT || ""),
+    firebaseProject: normalizeText(process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "poetry-please"),
+    hostingTarget: "poetry-please",
+    functionsRevision: normalizeText(process.env.K_REVISION || ""),
+    functionSourceSha256: FUNCTION_SOURCE_SHA256,
+  });
+});
+
 // imageTypes
 app.get(getBoth("/imageTypes"), async (_req, res) => {
-  const [g, e, v] = await Promise.all([
-    getAllFrom(COLLECTIONS.graphics),
-    getAllFrom(COLLECTIONS.excerpts),
-    getAllFrom(COLLECTIONS.videos),
+  const [allContent, flaggedIds] = await Promise.all([
+    getAllContentCached(),
+    getFlaggedContentIds(),
   ]);
-  const all = [...g, ...e, ...v];
+  const all = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
   const imageTypes = [...new Set(all.map((i) => i.imageType).filter(Boolean))].sort();
   res.json(imageTypes);
 });
 
 // releaseCatalogs
 app.get(getBoth("/releaseCatalogs"), async (_req, res) => {
-  const [g, e, v] = await Promise.all([
-    getAllFrom(COLLECTIONS.graphics),
-    getAllFrom(COLLECTIONS.excerpts),
-    getAllFrom(COLLECTIONS.videos),
+  const [allContent, flaggedIds] = await Promise.all([
+    getAllContentCached(),
+    getFlaggedContentIds(),
   ]);
-  const all = [...g, ...e, ...v];
-  const cats = [...new Set(all.map((i) => i.releaseCatalog).filter(Boolean))].sort();
+  const all = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
+  const cats = uniqueReleaseCatalogs(all);
   res.json(cats);
+});
+
+app.get(getBoth("/books"), async (req, res) => {
+  const [allContent, flaggedIds] = await Promise.all([
+    getAllContentCached(),
+    getFlaggedContentIds(),
+  ]);
+  const all = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
+  const catalogKey = normalizeCatalogLookupKey(req.query?.catalog);
+  const books = [...new Set(all
+    .filter((item) => !catalogKey || normalizeCatalogLookupKey(item.releaseCatalog) === catalogKey)
+    .map((item) => item.book)
+    .filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  res.json(books);
 });
 
 // ratingsSummary
 app.get(getBoth("/ratingsSummary"), async (_req, res) => {
-  const votesSnap = await getAllFrom(COLLECTIONS.votes);
-  const compact = votesSnap.map((v) => ({ imageId: v.imageId, voteType: v.voteType }));
-  res.json(aggregateRatings(compact));
+  res.json(await getRatingsSummaryCached());
+});
+
+app.post(getBoth("/bootstrap"), async (req, res) => {
+  const decoded = await verifyIdTokenFromHeader(req);
+  const anonId = normalizeText(req.body?.anonId);
+  const userId = decoded?.email || anonId;
+  if (!userId) return res.status(400).json({ error: "missing_user_context" });
+
+  const limit = Math.max(10, Math.min(Number(req.body?.limit) || 20, 120));
+  const includeRatingsSummary = req.body?.includeRatingsSummary !== false;
+
+  const tasks = [
+    getAllContentCached(),
+    getFlaggedContentIds(),
+    getUniqueVotedImageIdsByUser(userId),
+  ];
+
+  if (includeRatingsSummary) {
+    tasks.push(getRatingsSummaryCached());
+  }
+
+  const [allContent, flaggedIds, votedIds, ratingsSummary = null] = await Promise.all(tasks);
+  const all = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
+  res.json(buildFeedPayload({ all, votedIds, limit, includeDomainMeta: false, ratingsSummary }));
+});
+
+app.post(getBoth("/fetchFiltered"), async (req, res) => {
+  const decoded = await verifyIdTokenFromHeader(req);
+  const anonId = normalizeText(req.body?.anonId);
+  const userId = decoded?.email || anonId;
+  if (!userId) return res.status(400).json({ error: "missing_user_context" });
+
+  const filters = {
+    type: normalizeText(req.body?.type),
+    catalog: normalizeText(req.body?.catalog),
+    author: normalizeText(req.body?.author),
+    book: normalizeText(req.body?.book),
+  };
+  const limit = Math.max(10, Math.min(Number(req.body?.limit) || 500, 5000));
+
+  const [allContent, flaggedIds, votedIds] = await Promise.all([
+    getAllContentCached(),
+    getFlaggedContentIds(),
+    getUniqueVotedImageIdsByUser(userId),
+  ]);
+
+  const all = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
+  const filteredAll = filterContentByFeedFilters(all, filters);
+  const filteredNew = filteredAll.filter((o) => !votedIds.has((o.imageId || "").trim().toLowerCase()));
+
+  res.json({
+    allGraphics: filteredAll.map(mapToCounterArr),
+    newGraphics: sampleItems(filteredNew, limit).map(mapToArr),
+    totalImages: all.length,
+    votedImagesCount: votedIds.size,
+    remainingImagesCount: filteredNew.length,
+    domainTotalImages: filteredAll.length,
+    domainVotedImagesCount: Math.max(filteredAll.length - filteredNew.length, 0),
+    domainRemainingImagesCount: filteredNew.length,
+    releaseCatalogs: uniqueReleaseCatalogs(all),
+    imageTypes: [...new Set(all.map((o) => o.imageType).filter(Boolean))].sort(),
+  });
+});
+
+app.get(getBoth("/contentById"), async (req, res) => {
+  const targetId = normalizeText(req.query?.id);
+  if (!targetId) return res.status(400).json({ error: "missing_id" });
+
+  const [allContent, flaggedIds] = await Promise.all([
+    getAllContentCached(),
+    getFlaggedContentIds(),
+  ]);
+  const all = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
+  const normalizedTarget = normalizeKey(targetId);
+  const item = all.find((entry) =>
+    normalizeKey(entry.imageId) === normalizedTarget || normalizeKey(entry.contentId) === normalizedTarget
+  );
+
+  if (!item) return res.status(404).json({ error: "not_found" });
+
+  res.json({
+    item: mapToArr(item),
+    imageId: item.imageId || "",
+    contentId: item.contentId || "",
+  });
+});
+
+app.get(getBoth("/scoreboard/textPreview"), async (req, res) => {
+  const targetId = normalizeText(req.query?.id);
+  if (!targetId) return res.status(400).send("Missing content id.");
+
+  const [allContent, flaggedIds] = await Promise.all([
+    getAllContentCached(),
+    getFlaggedContentIds(),
+  ]);
+  const all = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
+  const normalizedTarget = normalizeKey(targetId);
+  const item = all.find((entry) =>
+    normalizeKey(entry.imageId) === normalizedTarget || normalizeKey(entry.contentId) === normalizedTarget
+  );
+
+  if (!item) return res.status(404).send("Content not found.");
+  if (!normalizeText(item.excerpt || item.text)) return res.status(404).send("No text preview is available for this item.");
+
+  res.type("html").send(renderScoreboardTextPreviewPage(item));
+});
+
+// scoreboard
+app.get(getBoth("/scoreboard"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["team", "admin"]);
+  if (!ctx) return;
+  const result = await getScoreboardPayloadFromSnapshot();
+  if (normalizeText(req.query?.paged) === "1") {
+    const pageSize = Math.max(1, Math.min(Number(req.query?.pageSize) || 25, 100));
+    const page = Math.max(1, Number(req.query?.page) || 1);
+    const rows = sortScoreboardRows(
+      applyScoreboardQuery(result.payload, req.query),
+      normalizeText(req.query?.sortKey || "bookTitle"),
+      Number(req.query?.sortDir || 1)
+    );
+    const start = (page - 1) * pageSize;
+    return res.json({
+      ok: true,
+      aggregated: rows.slice(start, start + pageSize),
+      totalRows: rows.length,
+      page,
+      pageSize,
+      filterOptions: buildScoreboardFilterOptions(result.payload),
+      snapshotMeta: {
+        source: result.source,
+        builtAtMs: result.builtAtMs,
+        ttlMs: SCOREBOARD_SNAPSHOT_TTL_MS,
+      },
+    });
+  }
+  res.json({
+    ...result.payload,
+    snapshotMeta: {
+      source: result.source,
+      builtAtMs: result.builtAtMs,
+      ttlMs: SCOREBOARD_SNAPSHOT_TTL_MS,
+    },
+  });
+});
+
+app.get(getBoth("/scoreboard/fullPoems"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["team", "admin"]);
+  if (!ctx) return;
+  const requestedBook = normalizeText(req.query?.book);
+  const requestedCatalog = normalizeText(req.query?.catalog);
+
+  const [result, fullPoemItems, flagSnap] = await Promise.all([
+    getScoreboardPayloadFromSnapshot(),
+    getAllFrom(COLLECTIONS.fullPoems),
+    db.collection(COLLECTIONS.contentFlags).where("status", "==", "pending").limit(1000).get(),
+  ]);
+  const rows = result.payload?.aggregated || [];
+  const poemKey = (row = {}) => [
+    sanitizeDocIdSegment(row.bookShortener || "") || `${normalizeKey(row.author)}|${normalizeCatalogLookupKey(row.bookTitle || row.book)}`,
+    normalizeKey(row.poemTitle || row.title),
+  ].join("|");
+  const requestedBookKey = normalizeCatalogLookupKey(requestedBook);
+  const requestedCatalogKey = normalizeCatalogLookupKey(requestedCatalog);
+  const scoredByImageId = new Map(rows.map((row) => [normalizeKey(row.imageId), row]));
+  const flagsByImageId = new Map();
+  flagSnap.docs.forEach((doc) => {
+    const flag = { id: doc.id, ...(doc.data() || {}) };
+    const key = normalizeKey(flag.imageId);
+    if (!key) return;
+    flagsByImageId.set(key, [...(flagsByImageId.get(key) || []), flag]);
+  });
+  const connectedByPoem = new Map();
+  rows.forEach((row) => {
+    if (!["exc", "qi", "int", "vv", "yt"].includes(normalizeKey(row.type))) return;
+    const key = poemKey(row);
+    connectedByPoem.set(key, [...(connectedByPoem.get(key) || []), row]);
+  });
+
+  const fullPoems = fullPoemItems
+    .filter((item) => !requestedBookKey || normalizeCatalogLookupKey(resolveScoreboardBookTitle(item)) === requestedBookKey)
+    .filter((item) => !requestedCatalogKey || normalizeCatalogLookupKey(item.releaseCatalog) === requestedCatalogKey)
+    .map((item) => {
+      const row = scoredByImageId.get(normalizeKey(item.imageId)) || {
+        imageId: item.imageId || "",
+        author: item.author || "",
+        poemTitle: item.title || "",
+        bookTitle: resolveScoreboardBookTitle(item) || requestedBook,
+        type: "FP",
+      };
+      const flags = flagsByImageId.get(normalizeKey(item.imageId)) || [];
+      const connected = connectedByPoem.get(poemKey(row)) || [];
+      const connectedWithVotes = connected.filter((item) => Number(item.totalVotes || 0) > 0);
+      const connectedContentBonus = Number(row.fpDerivativePoints || 0);
+      const connectedTypeCounts = connected.reduce((counts, connectedItem) => {
+        const type = normalizeText(connectedItem.type).toUpperCase();
+        if (type) counts[type] = (counts[type] || 0) + 1;
+        return counts;
+      }, {});
+      const signalCount = Number(row.totalVotes || 0) + connectedContentBonus;
+      const signalLevel = signalCount === 0 ? "none" : signalCount <= 3 ? "low" : signalCount <= 9 ? "moderate" : "strong";
+      const authorAdjustment = (Number(row.authorLikes || 0) * 9)
+        + (Number(row.authorMovedMe || 0) * 23)
+        - (Number(row.authorDislikes || 0) * 99);
+      return {
+        imageId: row.imageId || "",
+        author: row.author || "",
+        title: row.poemTitle || "",
+        book: row.bookTitle || requestedBook,
+        catalog: item.releaseCatalog || row.releaseCatalog || "",
+        flagged: flags.length > 0,
+        flags: flags.map((flag) => ({
+          id: flag.id,
+          note: flag.note || "",
+          qualityLane: flag.qualityLane || "",
+          flaggedByEmail: flag.flaggedByEmail || "",
+          createdAt: flag.createdAt || null,
+        })),
+        totalScore: Number(row.score || 0),
+        directScore: Number(row.score || 0) - connectedContentBonus,
+        connectedContentBonus,
+        connectedTypeCounts,
+        connectedVotedCount: connectedWithVotes.length,
+        connectedVoteScore: connectedWithVotes.reduce((sum, item) => sum + Number(item.score || 0), 0),
+        textFingerprint: normalizeTextBody(item.excerpt || item.fullText || item.text || "")
+          ? createHash("sha256")
+            .update(normalizeTextBody(item.excerpt || item.fullText || item.text || "").toLowerCase())
+            .digest("hex")
+          : "",
+        signalCount,
+        signalLevel,
+        likes: Number(row.likes || 0),
+        movedMe: Number(row.movedMe || 0),
+        dislikes: Number(row.dislikes || 0),
+        meh: Number(row.meh || 0),
+        totalVotes: Number(row.totalVotes || 0),
+        scoreBreakdown: {
+          likePoints: Number(row.likes || 0),
+          movedMePoints: Number(row.movedMe || 0) * 2,
+          dislikePoints: -Number(row.dislikes || 0),
+          authorAdjustment,
+          connectedContentBonus,
+          totalScore: Number(row.score || 0),
+        },
+        connectedItems: connected
+          .map((item) => ({
+            imageId: item.imageId || "",
+            type: normalizeText(item.type).toUpperCase(),
+            title: item.poemTitle || "",
+            score: Number(item.score || 0),
+            totalVotes: Number(item.totalVotes || 0),
+            fpBonusContribution: 1,
+          }))
+          .sort((a, b) => (b.totalVotes - a.totalVotes) || (b.score - a.score) || a.type.localeCompare(b.type)),
+      };
+    })
+    .sort((a, b) => (
+      (Number(a.flagged) - Number(b.flagged))
+      ||
+      (b.totalScore - a.totalScore)
+      || (b.connectedVotedCount - a.connectedVotedCount)
+      || (b.movedMe - a.movedMe)
+      || (b.totalVotes - a.totalVotes)
+      || a.title.localeCompare(b.title)
+    ))
+    .reduce((ranked, row) => {
+      const activeRank = row.flagged ? null : ranked.activeRank + 1;
+      const bookKey = normalizeCatalogLookupKey(row.book);
+      const bookRank = row.flagged ? null : (ranked.bookRanks.get(bookKey) || 0) + 1;
+      ranked.rows.push({ rank: activeRank, bookRank, ...row });
+      ranked.activeRank = activeRank || ranked.activeRank;
+      if (bookRank) ranked.bookRanks.set(bookKey, bookRank);
+      return ranked;
+    }, { activeRank: 0, bookRanks: new Map(), rows: [] }).rows;
+
+  const summaryMap = fullPoems.reduce((summaries, row) => {
+    const key = normalizeCatalogLookupKey(row.book);
+    const summary = summaries.get(key) || {
+      book: row.book,
+      catalog: row.catalog,
+      poemCount: 0,
+      reviewedPoemCount: 0,
+      noSignalCount: 0,
+      lowSignalCount: 0,
+      flaggedCount: 0,
+      totalScore: 0,
+      totalSignals: 0,
+      topPoem: "",
+      topPoemScore: null,
+    };
+    summary.poemCount += 1;
+    summary.reviewedPoemCount += Number(row.totalVotes || 0) > 0 ? 1 : 0;
+    summary.noSignalCount += row.signalLevel === "none" ? 1 : 0;
+    summary.lowSignalCount += row.signalLevel === "low" ? 1 : 0;
+    summary.flaggedCount += row.flagged ? 1 : 0;
+    summary.totalScore += Number(row.totalScore || 0);
+    summary.totalSignals += Number(row.signalCount || 0);
+    if (!row.flagged && (summary.topPoemScore === null || Number(row.totalScore || 0) > summary.topPoemScore)) {
+      summary.topPoem = row.title;
+      summary.topPoemScore = Number(row.totalScore || 0);
+    }
+    summaries.set(key, summary);
+    return summaries;
+  }, new Map());
+
+  BOOK_CATALOG_LOOKUP_ROWS
+    .filter((record) => normalizeText(record?.entityType || "book") === "book")
+    .filter((record) => normalizeCatalogLookupKey(record?.title) !== "flee")
+    .filter((record) => !requestedCatalog || normalizeCatalogLookupKey(record?.releaseCatalog) === normalizeCatalogLookupKey(requestedCatalog))
+    .filter((record) => !requestedBook || normalizeCatalogLookupKey(record?.title) === normalizeCatalogLookupKey(requestedBook))
+    .forEach((record) => {
+      const key = normalizeCatalogLookupKey(record.title);
+      if (summaryMap.has(key)) return;
+      summaryMap.set(key, {
+        book: record.title,
+        catalog: record.releaseCatalog,
+        poemCount: 0,
+        reviewedPoemCount: 0,
+        noSignalCount: 0,
+        lowSignalCount: 0,
+        flaggedCount: 0,
+        totalScore: 0,
+        totalSignals: 0,
+        topPoem: "",
+        topPoemScore: null,
+      });
+    });
+
+  const importedBookSummaries = Array.from(summaryMap.values());
+
+  const bookSummaries = (await mapWithConcurrency(importedBookSummaries, 6, async (summary) => {
+    const canonicalPoems = await getCanonicalPoems(summary.book);
+    const catalogPoemCount = canonicalPoems === null ? null : canonicalPoems.length;
+    const importedFpCount = summary.poemCount;
+    const importedRows = fullPoems.filter((row) => normalizeCatalogLookupKey(row.book) === normalizeCatalogLookupKey(summary.book));
+    const canonicalTitleCounts = new Map();
+    (canonicalPoems || []).forEach((poem) => {
+      const key = normalizeCatalogLookupKey(poem.title);
+      if (key) canonicalTitleCounts.set(key, (canonicalTitleCounts.get(key) || 0) + 1);
+    });
+    const importedByTitle = new Map();
+    importedRows.forEach((row) => {
+      const key = normalizeCatalogLookupKey(row.title);
+      importedByTitle.set(key, [...(importedByTitle.get(key) || []), row]);
+    });
+    let matchedFpCount = 0;
+    const extraFpItems = [];
+    importedByTitle.forEach((titleRows, titleKey) => {
+      const expectedCount = canonicalTitleCounts.get(titleKey) || 0;
+      matchedFpCount += Math.min(expectedCount, titleRows.length);
+      const textCounts = new Map();
+      titleRows.forEach((row) => {
+        if (row.textFingerprint) textCounts.set(row.textFingerprint, (textCounts.get(row.textFingerprint) || 0) + 1);
+      });
+      titleRows.slice(expectedCount).forEach((row) => {
+        extraFpItems.push({
+          imageId: row.imageId,
+          title: row.title,
+          author: row.author,
+          reason: expectedCount === 0
+            ? "Title not found in canonical catalog"
+            : (textCounts.get(row.textFingerprint) || 0) > 1
+              ? "Likely exact duplicate"
+              : "Repeated title with distinct text",
+        });
+      });
+    });
+    return {
+      ...summary,
+      catalogPoemCount,
+      catalogSourceUnavailable: catalogPoemCount === null
+        && normalizeCatalogLookupKey(summary.book) !== "short form 2026",
+      importedFpCount,
+      matchedFpCount: catalogPoemCount === null ? null : matchedFpCount,
+      missingFpCount: catalogPoemCount === null ? null : Math.max(catalogPoemCount - matchedFpCount, 0),
+      excessFpCount: catalogPoemCount === null ? 0 : extraFpItems.length,
+      extraFpItems,
+      importedPercent: catalogPoemCount
+        ? Math.min(100, Math.round((matchedFpCount / catalogPoemCount) * 100))
+        : null,
+      reviewedPercent: importedFpCount ? Math.round((summary.reviewedPoemCount / importedFpCount) * 100) : 0,
+      averageScore: importedFpCount ? Number((summary.totalScore / importedFpCount).toFixed(1)) : 0,
+    };
+  }))
+    .sort((a, b) => (
+      ((b.importedPercent ?? -1) - (a.importedPercent ?? -1))
+      || (b.reviewedPercent - a.reviewedPercent)
+      || (b.averageScore - a.averageScore)
+      || a.book.localeCompare(b.book)
+    ));
+
+  res.json({
+    ok: true,
+    book: requestedBook,
+    catalog: requestedCatalog,
+    count: fullPoems.length,
+    rows: fullPoems,
+    bookSummaries,
+    scoring: {
+      totalScore: "Current FP score: direct votes plus one point per connected derivative content item.",
+      connectedVoteScore: "Diagnostic only; connected-content vote scores are not yet rolled into the FP total.",
+    },
+    snapshotMeta: {
+      source: result.source,
+      builtAtMs: result.builtAtMs,
+      ttlMs: SCOREBOARD_SNAPSHOT_TTL_MS,
+    },
+  });
+});
+
+app.get(getBoth("/scoreboard/progress"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["team", "admin"]);
+  if (!ctx) return;
+  const result = await getScoreboardPayloadFromSnapshot();
+  const payload = result.payload || {};
+  const compactRow = (row = {}) => ({
+    imageId: row.imageId || "",
+    user: row.user || "",
+    bookTitle: row.bookTitle || "",
+    releaseCatalog: row.releaseCatalog || "",
+    type: row.type || "",
+    charCount: Number(row.charCount || 0),
+    totalVotes: Number(row.totalVotes || 0),
+  });
+  res.json({
+    ok: true,
+    aggregated: (payload.aggregated || []).map(compactRow),
+    rawVotes: (payload.rawVotes || []).map(compactRow),
+    allGraphics: (payload.allGraphics || []).map((row) => ({
+      ...compactRow(row),
+      missingCatalog: !!row.missingCatalog,
+      missingBucketUrl: !!row.missingBucketUrl,
+      flagged: !!row.flagged,
+    })),
+    snapshotMeta: {
+      source: result.source,
+      builtAtMs: result.builtAtMs,
+      ttlMs: SCOREBOARD_SNAPSHOT_TTL_MS,
+    },
+  });
+});
+
+app.get(getBoth("/scoreboard/bootstrap"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["team", "admin"]);
+  if (!ctx) return;
+  const payload = await getScoreboardBootstrapPayload();
+  res.json(payload);
+});
+
+app.get(getBoth("/admin/teamProgress"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  let result = await getScoreboardPayloadFromSnapshot();
+  const needsTimestampedVotes = (result.payload?.rawVotes || []).some((row) => row && row.time === undefined);
+  if (needsTimestampedVotes) {
+    result = await getScoreboardPayloadFromSnapshot({ forceRefresh: true });
+  }
+  res.json({
+    ...buildAdminTeamProgressPayload(result.payload, req.query || {}),
+    snapshotMeta: {
+      source: result.source,
+      builtAtMs: result.builtAtMs,
+      ttlMs: SCOREBOARD_SNAPSHOT_TTL_MS,
+    },
+  });
+});
+
+app.get(getBoth("/pig/ranked-texts"), async (req, res) => {
+  const ctx = await requirePigReadAccess(req, res);
+  if (!ctx) return;
+  const limit = Math.max(1, Math.min(Number(req.query?.limit) || 100, 500));
+  const minScore = Math.max(0, Number(req.query?.minScore) || 1);
+  const minVotes = Math.max(0, Number(req.query?.minVotes) || 1);
+  const types = normalizeText(req.query?.types || "EXC,FP")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const payload = await buildRankedTextsPayload({ limit, minScore, minVotes, types });
+  res.json(payload);
+});
+
+app.post(getBoth("/admin/scoreboard/refresh"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  const result = await getScoreboardPayloadFromSnapshot({ forceRefresh: true });
+  res.json({
+    ok: true,
+    source: result.source,
+    builtAtMs: result.builtAtMs,
+    aggregatedCount: Array.isArray(result.payload?.aggregated) ? result.payload.aggregated.length : 0,
+    rawVotesCount: Array.isArray(result.payload?.rawVotes) ? result.payload.rawVotes.length : 0,
+  });
+});
+
+app.post(getBoth("/scoreboard/exportSheet"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["team", "admin"]);
+  if (!ctx) return;
+
+  const isUserView = !!req.body?.isUserView;
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  if (!rows.length) return res.status(400).json({ error: "no_rows" });
+  const requestedIds = new Set(rows.map((row) => normalizeKey(row?.imageId)).filter(Boolean));
+  const freshContent = requestedIds.size ? await getAllContentCached({ forceRefresh: true }) : [];
+  const freshMetaById = new Map();
+  freshContent.forEach((item) => {
+    const keys = uniq([item.imageId, item.contentId].map(normalizeKey).filter(Boolean));
+    if (!keys.some((key) => requestedIds.has(key))) return;
+    const freshMeta = {
+      fileLink: normalizeText(item.imageUrl || item.url || item.videoUrl || item.bookLink || ""),
+      cloudLink: normalizeText(item.imageUrl || item.url || item.videoUrl || ""),
+      driveLink: normalizeText(item.driveLink || ""),
+      sourceFolderLink: normalizeText(item.sourceFolderLink || readMiscValue(item.misc, "sourceFolderLink")),
+      sourceFileName: normalizeText(item.sourceFileName || readMiscValue(item.misc, "sourceFileName")),
+    };
+    keys.forEach((key) => freshMetaById.set(key, freshMeta));
+  });
+
+  const enrichedRows = rows.map((row) => {
+    const freshMeta = freshMetaById.get(normalizeKey(row?.imageId)) || {};
+    return {
+      ...row,
+      cloudLink: row?.cloudLink || freshMeta.cloudLink || "",
+      driveLink: row?.driveLink || freshMeta.driveLink || "",
+      sourceFolderLink: row?.sourceFolderLink || freshMeta.sourceFolderLink || "",
+      sourceFileName: row?.sourceFileName || freshMeta.sourceFileName || "",
+      fileLink: row?.fileLink || freshMeta.fileLink || "",
+    };
+  });
+  if (req.body?.enrichOnly) {
+    return res.json({ ok: true, rows: enrichedRows });
+  }
+
+  const headers = isUserView
+    ? ["imageId", "author", "poemTitle", "bookTitle", "type", "charCount", "fileLink", "cloudLink", "driveLink", "sourceFolderLink", "sourceFileName", "excerpt", "vote"]
+    : ["imageId", "author", "poemTitle", "bookTitle", "type", "charCount", "fileLink", "cloudLink", "driveLink", "sourceFolderLink", "sourceFileName", "excerpt", "likes", "dislikes", "meh", "movedMe", "totalVotes", "fpDerivativePoints", "score"];
+
+  const normalizedRows = enrichedRows.map((row) =>
+    headers.map((key) => {
+      const rawValue = key === "fileLink" ? (row?.driveLink || row?.fileLink || row?.cloudLink) : row?.[key];
+      return typeof rawValue === "string" ? rawValue : rawValue == null ? "" : String(rawValue);
+    })
+  );
+
+  const titleDate = new Date().toISOString().slice(0, 10);
+  const title = `Poetry Please Scoreboard ${titleDate}`;
+  try {
+    const sheet = await createGoogleSheet({
+      title,
+      headers,
+      rows: normalizedRows,
+      shareWithEmail: normalizeText(ctx.decoded.email).toLowerCase(),
+    });
+    res.json({ ok: true, ...sheet });
+  } catch (err) {
+    console.error("Scoreboard exportSheet failed", err);
+    res.status(err.status || 500).json({ error: "sheet_export_failed", message: err.message });
+  }
 });
 
 // fetchData (auth)
 app.post(getBoth("/fetchData"), async (req, res) => {
   const decoded = await verifyIdTokenFromHeader(req);
   if (!decoded?.email) return res.status(401).json({ error: "auth" });
+  const includeDomainMeta = req.body?.includeDomainMeta !== false;
+  const maxLimit = includeDomainMeta ? 5000 : 120;
+  const limit = Math.max(10, Math.min(Number(req.body?.limit) || 20, maxLimit));
 
-  const [g, e, v] = await Promise.all([
-    getAllFrom(COLLECTIONS.graphics),
-    getAllFrom(COLLECTIONS.excerpts),
-    getAllFrom(COLLECTIONS.videos),
+  const [allContent, flaggedIds, votedIds] = await Promise.all([
+    getAllContentCached(),
+    getFlaggedContentIds(),
+    getUniqueVotedImageIdsByUser(decoded.email),
   ]);
-  const all = [...g, ...e, ...v];
-
-  const voted = await getVotesByUser(decoded.email);
-  const votedIds = new Set(voted.map((x) => (x.imageId || "").trim().toLowerCase()));
-  const newObjs = all.filter((o) => !votedIds.has((o.imageId || "").trim().toLowerCase()));
-
-  const releaseCatalogs = [...new Set(all.map((o) => o.releaseCatalog).filter(Boolean))].sort();
-  const imageTypes = [...new Set(all.map((o) => o.imageType).filter(Boolean))].sort();
-
-  res.json({
-    allGraphics: all.map(mapToArr),
-    newGraphics: newObjs.map(mapToArr),
-    totalImages: all.length,
-    votedImagesCount: voted.length,
-    remainingImagesCount: newObjs.length,
-    releaseCatalogs,
-    imageTypes,
-  });
+  const all = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
+  res.json(buildFeedPayload({ all, votedIds, limit, includeDomainMeta }));
 });
 
 // fetchDataAnon
 app.post(getBoth("/fetchDataAnon"), async (req, res) => {
   const anonId = (req.body?.anonId || "").trim();
   if (!anonId) return res.status(400).json({ error: "missing anonId" });
+  const includeDomainMeta = req.body?.includeDomainMeta !== false;
+  const maxLimit = includeDomainMeta ? 5000 : 120;
+  const limit = Math.max(10, Math.min(Number(req.body?.limit) || 20, maxLimit));
 
-  const [g, e, v] = await Promise.all([
-    getAllFrom(COLLECTIONS.graphics),
-    getAllFrom(COLLECTIONS.excerpts),
-    getAllFrom(COLLECTIONS.videos),
+  const [allContent, flaggedIds, votedIds] = await Promise.all([
+    getAllContentCached(),
+    getFlaggedContentIds(),
+    getUniqueVotedImageIdsByUser(anonId),
   ]);
-  const all = [...g, ...e, ...v];
-  const voted = await getVotesByUser(anonId);
-  const votedIds = new Set(voted.map((x) => (x.imageId || "").trim().toLowerCase()));
-  const newObjs = all.filter((o) => !votedIds.has((o.imageId || "").trim().toLowerCase()));
-
-  const releaseCatalogs = [...new Set(all.map((o) => o.releaseCatalog).filter(Boolean))].sort();
-  const imageTypes = [...new Set(all.map((o) => o.imageType).filter(Boolean))].sort();
-
-  res.json({
-    allGraphics: all.map(mapToArr),
-    newGraphics: newObjs.map(mapToArr),
-    totalImages: all.length,
-    votedImagesCount: voted.length,
-    remainingImagesCount: newObjs.length,
-    releaseCatalogs,
-    imageTypes,
-  });
+  const all = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
+  res.json(buildFeedPayload({ all, votedIds, limit, includeDomainMeta }));
 });
 
 // submitVote
@@ -284,11 +5019,3226 @@ app.post(getBoth("/vote"), async (req, res) => {
     };
 
     await db.collection(COLLECTIONS.votes).add(vote);
+    ratingsCache.builtAt = 0;
+    ratingsCache.payload = null;
+    ratingsCache.inFlight = null;
+    await invalidateScoreboardSnapshot(`vote_created:${imageId}`);
     res.status(204).end(); // success
   } catch (err) {
     console.error("Vote error:", err);
     res.status(500).json({ error: "internal", message: err.message });
   }
+});
+
+app.get(getBoth("/me"), async (req, res) => {
+  const ctx = await requireDecodedUser(req, res);
+  if (!ctx) return;
+  const fresh = (await getUserRecord(ctx.decoded.uid)) || ctx.userRecord || {};
+  res.json({
+    uid: ctx.decoded.uid,
+    email: ctx.decoded.email || "",
+    displayName: ctx.decoded.name || fresh.displayName || "",
+    roles: Array.isArray(fresh.roles) ? fresh.roles : ["user"],
+    authorProfileId: fresh.authorProfileId || null,
+  });
+});
+
+app.post(getBoth("/me/scrubRecentMeh"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["team", "admin"]);
+  if (!ctx) return;
+  const userId = normalizeText(ctx.decoded.email || "");
+  if (!userId) {
+    return res.status(400).json({ error: "missing_email" });
+  }
+  const hours = Math.max(1, Math.min(168, Number(req.body?.hours || 24) || 24));
+  const cutoffMs = Date.now() - (hours * 60 * 60 * 1000);
+  const voteDocs = await getVoteDocsByUser(userId);
+  const refsToDelete = voteDocs
+    .filter((vote) => vote.voteType === "meh" && timestampToMs(vote.timestamp) >= cutoffMs)
+    .map((vote) => vote.ref);
+
+  let deleted = 0;
+  for (let i = 0; i < refsToDelete.length; i += 400) {
+    const chunk = refsToDelete.slice(i, i + 400);
+    const batch = db.batch();
+    chunk.forEach((ref) => batch.delete(ref));
+    await batch.commit();
+    deleted += chunk.length;
+  }
+
+  if (deleted) {
+    await invalidateScoreboardSnapshot("scrub_recent_meh");
+  }
+
+  res.json({ ok: true, deleted, hours });
+});
+
+app.post(getBoth("/mergeAnonVotes"), async (req, res) => {
+  const ctx = await requireDecodedUser(req, res);
+  if (!ctx) return;
+
+  const anonId = normalizeText(req.body?.anonId);
+  if (!anonId) return res.status(400).json({ error: "missing_anon_id" });
+
+  const targetUserId = normalizeText(ctx.decoded.email).toLowerCase();
+  if (!targetUserId) return res.status(400).json({ error: "missing_target_user" });
+  if (normalizeText(anonId).toLowerCase() === targetUserId) {
+    return res.json({ ok: true, mergedVotes: 0, deletedVotes: 0 });
+  }
+
+  const [anonVotes, existingVotes] = await Promise.all([
+    getVoteDocsByUser(anonId),
+    getVoteDocsByUser(targetUserId),
+  ]);
+
+  const latestFor = (votes) => {
+    const map = new Map();
+    votes.forEach((vote) => {
+      const key = normalizeKey(vote.imageId || "");
+      if (!key) return;
+      const prev = map.get(key);
+      const prevMs = prev?.timestamp?.toMillis ? prev.timestamp.toMillis() : 0;
+      const curMs = vote?.timestamp?.toMillis ? vote.timestamp.toMillis() : 0;
+      if (!prev || curMs >= prevMs) map.set(key, vote);
+    });
+    return map;
+  };
+
+  const latestAnon = latestFor(anonVotes);
+  const latestExisting = latestFor(existingVotes);
+
+  let mergedVotes = 0;
+  let deletedVotes = 0;
+  const writes = [];
+
+  latestAnon.forEach((anonVote, key) => {
+    const existingVote = latestExisting.get(key);
+    const anonMs = anonVote?.timestamp?.toMillis ? anonVote.timestamp.toMillis() : 0;
+    const existingMs = existingVote?.timestamp?.toMillis ? existingVote.timestamp.toMillis() : 0;
+    if (!existingVote || anonMs >= existingMs) {
+      writes.push(
+        db.collection(COLLECTIONS.votes).add({
+          imageId: anonVote.imageId,
+          voteType: anonVote.voteType,
+          userId: targetUserId,
+          timestamp: anonVote.timestamp || FieldValue.serverTimestamp(),
+        })
+      );
+      mergedVotes += 1;
+    }
+  });
+
+  anonVotes.forEach((voteDoc) => {
+    writes.push(voteDoc.ref.delete());
+    deletedVotes += 1;
+  });
+
+  await Promise.all(writes);
+  res.json({ ok: true, mergedVotes, deletedVotes });
+});
+
+app.get(getBoth("/authorProfiles/:slug"), async (req, res) => {
+  const slug = slugify(req.params.slug || "");
+  if (!slug) return res.status(400).json({ error: "missing_slug" });
+
+  const snap = await db
+    .collection(COLLECTIONS.authorProfiles)
+    .where("slug", "==", slug)
+    .limit(1)
+    .get();
+  if (snap.empty) return res.status(404).json({ error: "not_found" });
+
+  const profile = mapProfileDoc(snap.docs[0].id, snap.docs[0].data());
+  if (!profile.published) return res.status(404).json({ error: "not_found" });
+
+  const [g, e, fp, v, votes, flaggedIds, authorVoteUserIds] = await Promise.all([
+    getAllFrom(COLLECTIONS.graphics),
+    getAllFrom(COLLECTIONS.excerpts),
+    getAllFrom(COLLECTIONS.fullPoems),
+    getAllFrom(COLLECTIONS.videos),
+    getAllVotes(),
+    getFlaggedContentIds(),
+    getAuthorVoteUserIds(),
+  ]);
+  const ratings = aggregateRatings(votes.map((vote) => ({ imageId: vote.imageId, voteType: vote.voteType, userId: vote.userId })), { authorVoteUserIds });
+  const allContent = excludeFlaggedContent([...g, ...e, ...fp, ...v], flaggedIds);
+  const { authored, featured } = pickProfileContent(profile, allContent, ratings);
+
+  res.json({
+    profile,
+    stats: {
+      authoredCount: authored.length,
+      featuredCount: featured.length,
+      featuredFallback: !(profile.featuredContentIds || []).length,
+    },
+    featuredContent: featured,
+    authoredContent: authored,
+  });
+});
+
+app.get(getBoth("/my/authorProfile"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["author", "admin"]);
+  if (!ctx) return;
+  const userRecord = (await getUserRecord(ctx.decoded.uid)) || ctx.userRecord || {};
+  if (!userRecord.authorProfileId) return res.json({ profile: null });
+
+  const snap = await db.collection(COLLECTIONS.authorProfiles).doc(userRecord.authorProfileId).get();
+  if (!snap.exists) return res.json({ profile: null });
+  res.json({ profile: mapProfileDoc(snap.id, snap.data()) });
+});
+
+app.get(getBoth("/my/submissions"), async (req, res) => {
+  const ctx = await requireDecodedUser(req, res);
+  if (!ctx) return;
+
+  const snap = await db.collection(COLLECTIONS.contentSubmissions)
+    .where("submitterUid", "==", ctx.decoded.uid)
+    .limit(250)
+    .get();
+  const submissions = snap.docs
+    .map(mapSubmissionDoc)
+    .sort((a, b) => (normalizeTimestamp(b.createdAt)?.getTime() || 0) - (normalizeTimestamp(a.createdAt)?.getTime() || 0))
+    .map((row) => ({
+      ...row,
+      hasNewPositiveResponse: hasNewPositiveResponse(row),
+    }));
+  const newPositiveResponses = submissions.filter((row) => row.hasNewPositiveResponse).length;
+  res.json({ submissions, newPositiveResponses });
+});
+
+app.post(getBoth("/my/submissions/markPositiveResponsesSeen"), async (req, res) => {
+  const ctx = await requireDecodedUser(req, res);
+  if (!ctx) return;
+
+  const snap = await db.collection(COLLECTIONS.contentSubmissions)
+    .where("submitterUid", "==", ctx.decoded.uid)
+    .limit(250)
+    .get();
+
+  await Promise.all(snap.docs.map((doc) => {
+    const data = mapSubmissionDoc(doc);
+    if (!hasNewPositiveResponse(data)) return Promise.resolve();
+    return doc.ref.set({
+      lastSeenPositiveResponseCount: positiveResponseCountForSubmission(data),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }));
+
+  res.json({ ok: true });
+});
+
+app.post(getBoth("/submissions"), async (req, res) => {
+  const ctx = await requireDecodedUser(req, res);
+  if (!ctx) return;
+
+  const submissionType = normalizeKey(req.body?.submissionType);
+  const title = normalizeText(req.body?.title || "").slice(0, USER_SUBMISSION_TITLE_MAX);
+  const text = normalizeText(req.body?.text || "");
+  const note = normalizeText(req.body?.note || "");
+
+  if (!["text", "image"].includes(submissionType)) {
+    return res.status(400).json({ error: "invalid_submission_type" });
+  }
+  if (!title) return res.status(400).json({ error: "missing_title" });
+
+  let payload = {
+    submissionType,
+    title,
+    releaseCatalog: USER_SUBMISSION_CATALOG,
+    status: "pending",
+    reviewNote: "",
+    submitterUid: ctx.decoded.uid,
+    submitterEmail: ctx.decoded.email,
+    submitterDisplayName: normalizeText(ctx.decoded.name || ctx.userRecord?.displayName || ctx.decoded.email),
+    positiveResponseCount: 0,
+    lastSeenPositiveResponseCount: 0,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+
+  if (submissionType === "text") {
+    if (!text) return res.status(400).json({ error: "missing_text" });
+    if (text.length > USER_SUBMISSION_TEXT_MAX) {
+      return res.status(400).json({ error: "text_too_long", maxChars: USER_SUBMISSION_TEXT_MAX });
+    }
+    payload.text = text;
+  } else {
+    if (note.length > USER_SUBMISSION_IMAGE_NOTE_MAX) {
+      return res.status(400).json({ error: "note_too_long", maxChars: USER_SUBMISSION_IMAGE_NOTE_MAX });
+    }
+    let upload;
+    try {
+      upload = parseBase64Upload(req.body, UPLOAD_RULES.userSubmissionImage);
+    } catch (err) {
+      return res.status(err.status || 400).json({ error: err.message || "invalid_upload" });
+    }
+    if (!upload.width || !upload.height) {
+      return res.status(400).json({ error: "missing_dimensions" });
+    }
+    if (upload.width > USER_SUBMISSION_IMAGE_MAX_WIDTH || upload.height > USER_SUBMISSION_IMAGE_MAX_HEIGHT) {
+      return res.status(400).json({
+        error: "image_dimensions_too_large",
+        maxWidth: USER_SUBMISSION_IMAGE_MAX_WIDTH,
+        maxHeight: USER_SUBMISSION_IMAGE_MAX_HEIGHT,
+      });
+    }
+    const submissionRef = db.collection(COLLECTIONS.contentSubmissions).doc();
+    const storagePath = `user-submissions/${ctx.decoded.uid}/${submissionRef.id}.${upload.extension}`;
+    const { publicUrl } = await saveImageUpload({
+      storagePath,
+      mimeType: upload.mimeType,
+      buffer: upload.buffer,
+    });
+    payload = {
+      ...payload,
+      note,
+      imageUrl: publicUrl,
+      imageWidth: upload.width,
+      imageHeight: upload.height,
+      mimeType: upload.mimeType,
+      fileSize: upload.fileSize,
+      storagePath,
+    };
+    await submissionRef.set(payload);
+    const saved = await submissionRef.get();
+    return res.json({ ok: true, submission: mapSubmissionDoc(saved) });
+  }
+
+  const submissionRef = db.collection(COLLECTIONS.contentSubmissions).doc();
+  await submissionRef.set(payload);
+  const saved = await submissionRef.get();
+  res.json({ ok: true, submission: mapSubmissionDoc(saved) });
+});
+
+app.get(getBoth("/submissions/approved"), async (req, res) => {
+  const decoded = await verifyIdTokenFromHeader(req);
+  const userId = decoded?.uid || "";
+  const [submissionSnap, responseSnap] = await Promise.all([
+    db.collection(COLLECTIONS.contentSubmissions).where("status", "==", "approved").limit(100).get(),
+    userId
+      ? db.collection(COLLECTIONS.submissionResponses).where("userId", "==", userId).limit(250).get()
+      : Promise.resolve({ docs: [] }),
+  ]);
+  const reactionsBySubmissionId = new Map(
+    (responseSnap.docs || []).map((doc) => {
+      const data = doc.data() || {};
+      return [data.submissionId || "", data.voteType || ""];
+    })
+  );
+  const submissions = submissionSnap.docs
+    .map(mapSubmissionDoc)
+    .sort((a, b) => (normalizeTimestamp(b.createdAt)?.getTime() || 0) - (normalizeTimestamp(a.createdAt)?.getTime() || 0))
+    .map((row) => ({
+      ...row,
+      currentUserReaction: reactionsBySubmissionId.get(row.id) || "",
+    }));
+  res.json({ submissions });
+});
+
+app.post(getBoth("/submissions/:submissionId/react"), async (req, res) => {
+  const ctx = await requireDecodedUser(req, res);
+  if (!ctx) return;
+
+  const submissionId = normalizeText(req.params.submissionId);
+  const voteType = normalizeKey(req.body?.voteType);
+  if (!submissionId) return res.status(400).json({ error: "missing_submission_id" });
+  if (!["like", "movedme", "meh", "dislike"].includes(voteType)) {
+    return res.status(400).json({ error: "invalid_vote_type" });
+  }
+
+  const submissionRef = db.collection(COLLECTIONS.contentSubmissions).doc(submissionId);
+  const submissionSnap = await submissionRef.get();
+  if (!submissionSnap.exists) return res.status(404).json({ error: "submission_not_found" });
+  if (normalizeKey(submissionSnap.data()?.status) !== "approved") {
+    return res.status(409).json({ error: "submission_not_approved" });
+  }
+
+  const responseId = `${submissionId}__${ctx.decoded.uid}`;
+  await db.collection(COLLECTIONS.submissionResponses).doc(responseId).set({
+    submissionId,
+    userId: ctx.decoded.uid,
+    userEmail: ctx.decoded.email || "",
+    voteType,
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  const summary = await recomputeSubmissionResponseSummary(submissionId);
+  res.json({ ok: true, summary, voteType });
+});
+
+
+app.get(getBoth("/my/authorProfileEditorData"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["author", "admin"]);
+  if (!ctx) return;
+
+  const userRecord = (await getUserRecord(ctx.decoded.uid)) || ctx.userRecord || {};
+  const profileId = userRecord.authorProfileId || ctx.decoded.uid;
+  const snap = await db.collection(COLLECTIONS.authorProfiles).doc(profileId).get();
+  const existingProfile = snap.exists ? mapProfileDoc(snap.id, snap.data()) : null;
+  const workingProfile = existingProfile || mapProfileDoc(profileId, {
+    displayName: ctx.decoded.name || userRecord.displayName || ctx.decoded.email,
+    slug: slugify(ctx.decoded.name || userRecord.displayName || ctx.decoded.email),
+    authorNameVariants: uniq([ctx.decoded.name, userRecord.displayName, ctx.decoded.email]),
+    featuredContentIds: [],
+    published: false,
+  });
+
+  const [g, e, fp, v, votes, flaggedIds, authorVoteUserIds] = await Promise.all([
+    getAllFrom(COLLECTIONS.graphics),
+    getAllFrom(COLLECTIONS.excerpts),
+    getAllFrom(COLLECTIONS.fullPoems),
+    getAllFrom(COLLECTIONS.videos),
+    getAllVotes(),
+    getFlaggedContentIds(),
+    getAuthorVoteUserIds(),
+  ]);
+  const ratings = aggregateRatings(votes.map((vote) => ({ imageId: vote.imageId, voteType: vote.voteType, userId: vote.userId })), { authorVoteUserIds });
+  const allContent = excludeFlaggedContent([...g, ...e, ...fp, ...v], flaggedIds);
+  const { authored, featured } = pickProfileContent(workingProfile, allContent, ratings);
+
+  res.json({
+    profile: existingProfile,
+    workingProfile,
+    authoredContent: authored,
+    featuredContent: featured,
+    stats: {
+      authoredCount: authored.length,
+      featuredCount: featured.length,
+    },
+  });
+});
+
+app.get(getBoth("/admin/authorReviewPreview"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["team", "admin"]);
+  if (!ctx) return;
+
+  const author = normalizeText(req.query?.author);
+  if (!author) return res.status(400).json({ error: "missing_author" });
+
+  const workingProfile = mapProfileDoc(`preview-${slugify(author)}`, {
+    displayName: author,
+    slug: slugify(author),
+    authorNameVariants: [author],
+    featuredContentIds: [],
+    published: false,
+  });
+
+  const [g, e, fp, v, votes, flaggedIds, authorVoteUserIds] = await Promise.all([
+    getAllFrom(COLLECTIONS.graphics),
+    getAllFrom(COLLECTIONS.excerpts),
+    getAllFrom(COLLECTIONS.fullPoems),
+    getAllFrom(COLLECTIONS.videos),
+    getAllVotes(),
+    getFlaggedContentIds(),
+    getAuthorVoteUserIds(),
+  ]);
+  const ratings = aggregateRatings(votes.map((vote) => ({ imageId: vote.imageId, voteType: vote.voteType, userId: vote.userId })), { authorVoteUserIds });
+  const allContent = excludeFlaggedContent([...g, ...e, ...fp, ...v], flaggedIds);
+  const { authored, featured } = pickProfileContent(workingProfile, allContent, ratings);
+
+  res.json({
+    profile: null,
+    workingProfile,
+    authoredContent: authored,
+    featuredContent: featured,
+    stats: {
+      authoredCount: authored.length,
+      featuredCount: featured.length,
+    },
+    preview: true,
+  });
+});
+
+app.post(getBoth("/authorProfiles"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["author", "admin"]);
+  if (!ctx) return;
+
+  const userRef = db.collection(COLLECTIONS.users).doc(ctx.decoded.uid);
+  const latestUser = (await userRef.get()).data() || {};
+  const profileId = latestUser.authorProfileId || ctx.userRecord.authorProfileId || ctx.decoded.uid;
+  const ref = db.collection(COLLECTIONS.authorProfiles).doc(profileId);
+  const existing = (await ref.get()).data() || {};
+
+  const displayName = normalizeText(req.body?.displayName || existing.displayName || ctx.decoded.name || ctx.decoded.email);
+  const payload = {
+    userId: ctx.decoded.uid,
+    email: ctx.decoded.email,
+    displayName,
+    slug: slugify(req.body?.slug || existing.slug || displayName),
+    bio: normalizeText(req.body?.bio || existing.bio),
+    shortBio: normalizeText(req.body?.shortBio || existing.shortBio),
+    photoUrl: normalizeText(req.body?.photoUrl || existing.photoUrl),
+    websiteUrl: normalizeText(req.body?.websiteUrl || existing.websiteUrl),
+    instagramUrl: normalizeText(req.body?.instagramUrl || existing.instagramUrl),
+    tiktokUrl: normalizeText(req.body?.tiktokUrl || existing.tiktokUrl),
+    youtubeUrl: normalizeText(req.body?.youtubeUrl || existing.youtubeUrl),
+    newsletterUrl: normalizeText(req.body?.newsletterUrl || existing.newsletterUrl),
+    bookstoreUrl: normalizeText(req.body?.bookstoreUrl || existing.bookstoreUrl),
+    customLinks: Array.isArray(req.body?.customLinks) ? req.body.customLinks : existing.customLinks || [],
+    authorNameVariants: uniq(req.body?.authorNameVariants || existing.authorNameVariants || [displayName]),
+    featuredContentIds: uniq(req.body?.featuredContentIds || existing.featuredContentIds || []),
+    published: req.body?.published ?? existing.published ?? false,
+    createdAt: existing.createdAt || FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+
+  await ref.set(payload, { merge: true });
+  await userRef.set(
+    {
+      authorProfileId: ref.id,
+      roles: Array.isArray(latestUser.roles) && latestUser.roles.includes("author")
+        ? latestUser.roles
+        : [...new Set([...(latestUser.roles || ["user"]), "author"])],
+    },
+    { merge: true }
+  );
+
+  const saved = await ref.get();
+  res.json({ ok: true, profile: mapProfileDoc(saved.id, saved.data()) });
+});
+
+
+app.post(getBoth("/authorAssets"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["author", "admin"]);
+  if (!ctx) return;
+
+  const assetType = normalizeText(req.body?.assetType || "profile_photo");
+  const storagePath = normalizeText(req.body?.storagePath);
+  const publicUrl = normalizeText(req.body?.publicUrl);
+  if (!storagePath || !publicUrl) {
+    return res.status(400).json({ error: "missing_asset_fields" });
+  }
+
+  const assetRef = db.collection(COLLECTIONS.authorAssets).doc();
+  await assetRef.set({
+    ownerUid: ctx.decoded.uid,
+    ownerEmail: ctx.decoded.email,
+    assetType,
+    storagePath,
+    publicUrl,
+    width: Number(req.body?.width || 0) || null,
+    height: Number(req.body?.height || 0) || null,
+    fileSize: Number(req.body?.fileSize || 0) || null,
+    mimeType: normalizeText(req.body?.mimeType),
+    status: "active",
+    createdAt: FieldValue.serverTimestamp(),
+  });
+
+  res.json({ ok: true, assetId: assetRef.id });
+});
+
+
+app.post(getBoth("/authorAssets/uploadPhoto"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["author", "admin"]);
+  if (!ctx) return;
+
+  let upload;
+  try {
+    upload = parseBase64Upload(req.body, UPLOAD_RULES.authorPhoto);
+  } catch (err) {
+    return res.status(err.status || 400).json({ error: err.message || "invalid_upload" });
+  }
+
+  const storagePath = `author-profile-images/${ctx.decoded.uid}/${Date.now()}.${upload.extension}`;
+  const { publicUrl } = await saveImageUpload({
+    storagePath,
+    mimeType: upload.mimeType,
+    buffer: upload.buffer,
+  });
+  const assetRef = db.collection(COLLECTIONS.authorAssets).doc();
+  await assetRef.set({
+    ownerUid: ctx.decoded.uid,
+    ownerEmail: ctx.decoded.email,
+    assetType: "profile_photo",
+    storagePath,
+    publicUrl,
+    width: upload.width,
+    height: upload.height,
+    fileSize: upload.fileSize,
+    mimeType: upload.mimeType,
+    status: "active",
+    createdAt: FieldValue.serverTimestamp(),
+  });
+
+  res.json({ ok: true, assetId: assetRef.id, storagePath, publicUrl });
+});
+
+
+app.get(getBoth("/my/contentClaims"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["author", "admin"]);
+  if (!ctx) return;
+
+  const snap = await db.collection(COLLECTIONS.contentClaims)
+    .where("requesterUid", "==", ctx.decoded.uid)
+    .limit(250)
+    .get();
+  const claims = snap.docs
+    .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
+    .sort((a, b) => (b.createdAt?._seconds || 0) - (a.createdAt?._seconds || 0));
+  res.json({ claims });
+});
+
+app.get(getBoth("/contentClaims/candidates"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["author", "admin"]);
+  if (!ctx) return;
+
+  const queryText = normalizeKey(req.query?.q || "");
+  if (!queryText) return res.json({ items: [] });
+  const allContent = await getAllContent();
+  const items = allContent
+    .filter((item) => mapToArr(item).some((value) => normalizeKey(value).includes(queryText)))
+    .slice(0, 40);
+  res.json({ items });
+});
+
+app.post(getBoth("/contentClaims"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["author", "admin"]);
+  if (!ctx) return;
+
+  const imageId = normalizeText(req.body?.imageId);
+  const note = normalizeText(req.body?.note || "");
+  if (!imageId) return res.status(400).json({ error: "missing_image_id" });
+
+  const existing = await db.collection(COLLECTIONS.contentClaims)
+    .where("requesterUid", "==", ctx.decoded.uid)
+    .where("imageId", "==", imageId)
+    .limit(20)
+    .get();
+  const duplicate = existing.docs.find((doc) => {
+    const status = normalizeText(doc.data()?.status || "pending");
+    return status === "pending" || status === "approved";
+  });
+  if (duplicate) return res.status(409).json({ error: "claim_exists", status: duplicate.data()?.status || "pending" });
+
+  const allContent = await getAllContent();
+  const item = allContent.find((entry) => normalizeKey(entry.imageId) === normalizeKey(imageId));
+  if (!item) return res.status(404).json({ error: "content_not_found" });
+
+  const userRecord = (await getUserRecord(ctx.decoded.uid)) || ctx.userRecord || {};
+  const profileId = userRecord.authorProfileId || ctx.decoded.uid;
+  const claimRef = db.collection(COLLECTIONS.contentClaims).doc();
+  await claimRef.set({
+    imageId: item.imageId,
+    title: item.title || "",
+    author: item.author || "",
+    imageType: item.imageType || "",
+    releaseCatalog: item.releaseCatalog || "",
+    requesterUid: ctx.decoded.uid,
+    requesterEmail: ctx.decoded.email,
+    profileId,
+    note,
+    status: "pending",
+    createdAt: FieldValue.serverTimestamp(),
+  });
+
+  res.json({ ok: true, claimId: claimRef.id });
+});
+
+
+app.post(getBoth("/contentFlags"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["author", "team", "admin"]);
+  if (!ctx) return;
+
+  const imageId = normalizeText(req.body?.imageId);
+  const note = normalizeText(req.body?.note || "");
+  if (!imageId) return res.status(400).json({ error: "missing_image_id" });
+  if (!note) return res.status(400).json({ error: "missing_note" });
+
+  const allContent = await getAllContent();
+  const item = allContent.find((entry) => normalizeKey(entry.imageId) === normalizeKey(imageId));
+  if (!item) return res.status(404).json({ error: "content_not_found" });
+  const result = await createContentFlagForItem(item, ctx, note);
+  if (!result.ok && result.reason === "already_flagged") {
+    return res.status(409).json({ error: "content_already_flagged", flag: result.flag });
+  }
+  invalidateFlaggedContentCache();
+  await invalidateScoreboardSnapshot(`flag_created:${item.imageId || ""}`);
+  res.json({ ok: true, flagId: result.flagId });
+});
+
+app.post(getBoth("/admin/contentFlags/batch"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const rawIdentifiers = Array.isArray(req.body?.identifiers) ? req.body.identifiers : [];
+  const note = normalizeText(req.body?.note || "");
+  if (!note) return res.status(400).json({ error: "missing_note" });
+
+  const identifiers = rawIdentifiers
+    .map((value) => normalizeText(value))
+    .filter(Boolean);
+  if (!identifiers.length) return res.status(400).json({ error: "missing_identifiers" });
+
+  const allContent = await getAllContent();
+  const contentById = new Map(allContent.map((entry) => [normalizeKey(entry.imageId), entry]));
+  const seen = new Set();
+  const results = [];
+
+  for (const rawIdentifier of identifiers) {
+    const normalizedIdentifier = normalizeKey(rawIdentifier);
+    if (!normalizedIdentifier || seen.has(normalizedIdentifier)) continue;
+    seen.add(normalizedIdentifier);
+
+    const item = contentById.get(normalizedIdentifier);
+    if (!item) {
+      results.push({ identifier: rawIdentifier, status: "not_found" });
+      continue;
+    }
+
+    const result = await createContentFlagForItem(item, ctx, note, { source: "batch_admin_flag" });
+    if (!result.ok && result.reason === "already_flagged") {
+      results.push({ identifier: rawIdentifier, imageId: item.imageId, status: "already_flagged", flagId: result.flag?.id || "" });
+      continue;
+    }
+    results.push({ identifier: rawIdentifier, imageId: item.imageId, status: "flagged", flagId: result.flagId });
+  }
+
+  if (results.some((entry) => entry.status === "flagged")) {
+    invalidateFlaggedContentCache();
+    await invalidateScoreboardSnapshot("batch_flag_created");
+  }
+  res.json({
+    ok: true,
+    processed: results.length,
+    flaggedCount: results.filter((entry) => entry.status === "flagged").length,
+    alreadyFlaggedCount: results.filter((entry) => entry.status === "already_flagged").length,
+    notFoundCount: results.filter((entry) => entry.status === "not_found").length,
+    results,
+  });
+});
+
+app.get(getBoth("/admin/contentFlags"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["team", "admin"]);
+  if (!ctx) return;
+
+  const allContent = await getAllContent();
+  const contentById = new Map(allContent.map((item) => [normalizeKey(item.imageId || ""), item]));
+  const snap = await db.collection(COLLECTIONS.contentFlags).limit(250).get();
+  const flags = snap.docs
+    .map((doc) => {
+      const data = doc.data() || {};
+      const current = contentById.get(normalizeKey(data.imageId || ""));
+      return {
+        id: doc.id,
+        ...(data || {}),
+        currentImageUrl: current?.imageUrl || data.currentImageUrl || "",
+        currentTitle: current?.title || data.title || "",
+      };
+    })
+    .sort((a, b) => (b.createdAt?._seconds || 0) - (a.createdAt?._seconds || 0));
+  res.json({ flags });
+});
+
+app.get(getBoth("/admin/contentLibrary"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const type = normalizeKey(req.query?.type || "all");
+  const queryText = normalizeKey(req.query?.q || "");
+  const collections = [];
+  const collectionConfigs = [];
+  if (type === "all" || type === "graphics") collections.push(COLLECTIONS.graphics);
+  if (type === "all" || type === "excerpts") collections.push(COLLECTIONS.excerpts);
+  if (type === "all" || type === "fullpoems" || type === "full-poems") collections.push(COLLECTIONS.fullPoems);
+  if (type === "all" || type === "videos" || type === "youtube") collections.push(COLLECTIONS.videos);
+  if (!collections.length) return res.status(400).json({ error: "invalid_content_type" });
+
+  collections.forEach((collection) => {
+    collectionConfigs.push({
+      collection,
+      imageType: type === "youtube" && collection === COLLECTIONS.videos ? "YT" : "",
+    });
+  });
+
+  const searchMode = !!queryText;
+  const rows = (await Promise.all(
+    collectionConfigs.map(async ({ collection, imageType }) => {
+      return getAdminContentDocs(collection, {
+        searchMode,
+        imageType,
+      });
+    })
+  ))
+    .flat()
+    .filter((row) => {
+      if (!queryText) return true;
+      return [
+        row.collection,
+        row.contentId,
+        row.imageType,
+        row.author,
+        row.title,
+        row.book,
+        row.channel,
+        row.releaseCatalog,
+      ].some((value) => normalizeKey(value).includes(queryText));
+    })
+    .sort((a, b) => {
+      const aTime = a.updatedAt?._seconds || a.createdAt?._seconds || 0;
+      const bTime = b.updatedAt?._seconds || b.createdAt?._seconds || 0;
+      return bTime - aTime;
+    });
+
+  const totalCount = searchMode
+    ? rows.length
+    : (await Promise.all(
+      collectionConfigs.map(({ collection, imageType }) => getAdminContentCount(collection, { imageType }))
+    )).reduce((sum, count) => sum + Number(count || 0), 0);
+  res.json({ items: rows.slice(0, 250), totalCount });
+});
+
+app.post(getBoth("/admin/contentLibrary/upsert"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  try {
+    const result = await upsertContentLibraryItem(req.body?.type, req.body, {
+      uid: ctx.decoded.uid,
+      email: ctx.decoded.email,
+    });
+    invalidateContentCache();
+    await invalidateScoreboardSnapshot(`content_upsert:${normalizeKey(result?.item?.id || "")}`);
+    res.json(result);
+  } catch (err) {
+    return res.status(err.status || 400).json({ error: err.message || "invalid_content_payload" });
+  }
+});
+
+app.post(getBoth("/admin/contentLibrary/bulkPreview"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const type = normalizeKey(req.body?.type);
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (!items.length) return res.status(400).json({ error: "missing_items" });
+
+  const results = [];
+  for (const item of items.slice(0, 500)) {
+    try {
+      const result = await previewContentLibraryItem(type, item);
+      results.push(result);
+    } catch (err) {
+      results.push({
+        ok: false,
+        id: deriveContentDocId(type, item) || "",
+        error: err.message || "preview_failed",
+      });
+    }
+  }
+
+  const createCount = results.filter((row) => row.ok && row.action === "create").length;
+  const updateCount = results.filter((row) => row.ok && row.action === "update").length;
+  const errorCount = results.filter((row) => !row.ok).length;
+  res.json({ ok: true, createCount, updateCount, errorCount, results });
+});
+
+app.post(getBoth("/admin/contentLibrary/weaverPreview"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  try {
+    const sourceUrl = normalizeText(req.body?.sourceUrl);
+    const defaultImageType = normalizeText(req.body?.imageType || "QI").toUpperCase();
+    const rawPayload = await fetchRemoteJson(sourceUrl);
+    const sourceRecords = flattenWeaverGraphicsRecords(rawPayload);
+    const eligibleRecords = sourceRecords.filter((record) => shouldImportWeaverGraphicRecord(record));
+    const mappedItems = buildWeaverGraphicsImportItems(rawPayload, { defaultImageType });
+    const { acceptedItems, duplicateItems } = await buildWeaverGraphicsDuplicatePlan(mappedItems);
+
+    if (!mappedItems.length) {
+      return res.status(400).json({ error: "no_importable_weaver_records" });
+    }
+
+    const results = [];
+    for (const item of acceptedItems.slice(0, 500)) {
+      try {
+        const result = await previewContentLibraryItem("graphics", item);
+        results.push(result);
+      } catch (err) {
+        results.push({
+          ok: false,
+          id: deriveContentDocId("graphics", item) || "",
+          error: err.message || "preview_failed",
+        });
+      }
+    }
+
+    const createCount = results.filter((row) => row.ok && row.action === "create").length;
+    const updateCount = results.filter((row) => row.ok && row.action === "update").length;
+    const errorCount = results.filter((row) => !row.ok).length;
+    res.json({
+      ok: true,
+      sourceCount: sourceRecords.length,
+      eligibleCount: eligibleRecords.length,
+      mappedCount: mappedItems.length,
+      duplicateCount: duplicateItems.length,
+      createCount,
+      updateCount,
+      errorCount,
+      results,
+      items: acceptedItems,
+      duplicateItems,
+    });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || "weaver_preview_failed" });
+  }
+});
+
+app.post(getBoth("/admin/contentLibrary/bulkUpsert"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const type = normalizeKey(req.body?.type);
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (!items.length) return res.status(400).json({ error: "missing_items" });
+
+  const results = [];
+  const existingGraphics = type === "graphics"
+    ? await getAdminContentDocs(COLLECTIONS.graphics, { searchMode: true })
+    : [];
+  const usedGraphicIds = new Set();
+  for (const item of items.slice(0, 500)) {
+    try {
+      let safeItem = item;
+      if (type === "graphics") {
+        const proposedId = deriveContentDocId(type, item);
+        const assigned = await assignImportAssistantGraphicDocId({
+          ...item,
+          suppliedDocId: proposedId,
+          suggestedDocId: proposedId,
+          contentItem: {
+            ...item,
+            docId: proposedId,
+            imageId: proposedId,
+          },
+        }, usedGraphicIds, existingGraphics);
+        if (assigned.error || !["create", "update"].includes(assigned.action)) {
+          const err = new Error(assigned.error || "graphic_match_review_required");
+          err.status = 409;
+          err.alternateMatches = assigned.row?.alternateMatches || [];
+          throw err;
+        }
+        safeItem = assigned.row.contentItem;
+      }
+      const result = await upsertContentLibraryItem(type, safeItem, {
+        uid: ctx.decoded.uid,
+        email: ctx.decoded.email,
+      });
+      results.push({
+        ok: true,
+        id: result.item?.id || "",
+        requestedId: deriveContentDocId(type, item) || "",
+        created: !!result.created,
+      });
+    } catch (err) {
+      results.push({
+        ok: false,
+        id: deriveContentDocId(type, item) || "",
+        error: err.message || "import_failed",
+        alternateMatches: err.alternateMatches || [],
+      });
+    }
+  }
+
+  const createdCount = results.filter((row) => row.ok && row.created).length;
+  const updatedCount = results.filter((row) => row.ok && !row.created).length;
+  const errorCount = results.filter((row) => !row.ok).length;
+  if (createdCount || updatedCount) {
+    invalidateContentCache();
+    await invalidateScoreboardSnapshot(`content_bulk_upsert:${type}`);
+  }
+  res.json({ ok: true, createdCount, updatedCount, errorCount, results });
+});
+
+app.get(getBoth("/admin/idHygiene/pigPreview"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  try {
+    const rows = await buildPigIdHygienePlan();
+    res.json({
+      ok: true,
+      total: rows.length,
+      eligibleCount: rows.filter((row) => row.eligible).length,
+      metadataFixCount: rows.filter((row) => !row.eligible && row.metadataFixEligible).length,
+      duplicateNameCount: rows.filter((row) => row.uniqueGraphicWithDuplicateName).length,
+      collisionSuffixCount: rows.filter((row) => row.collisionResolvedWithSuffix).length,
+      duplicateGraphicReviewCount: rows.filter((row) => (row.reasons || []).includes("duplicate_graphic_review")).length,
+      blockedCount: rows.filter((row) => !row.eligible).length,
+      rows,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || "pig_preview_failed" });
+  }
+});
+
+app.post(getBoth("/admin/idHygiene/applyPig"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  try {
+    const rows = await buildPigIdHygienePlan();
+    const results = await applyPigIdHygieneRows(rows, {
+      uid: ctx.decoded.uid,
+      email: ctx.decoded.email,
+    });
+    res.json({
+      ok: true,
+      attemptedCount: results.length,
+      updatedCount: results.filter((row) => row.ok).length,
+      renamedCount: results.filter((row) => row.ok && row.action === "rename").length,
+      metadataFixedCount: results.filter((row) => row.ok && row.action === "metadata").length,
+      errorCount: results.filter((row) => !row.ok).length,
+      results,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || "pig_apply_failed" });
+  }
+});
+
+async function importWeaverGraphicsPayload(rawPayload, defaultImageType, actor = {}) {
+  const sourceRecords = flattenWeaverGraphicsRecords(rawPayload);
+  const eligibleRecords = sourceRecords.filter((record) => shouldImportWeaverGraphicRecord(record, { defaultImageType }));
+  const mappedItems = buildWeaverGraphicsImportItems(rawPayload, { defaultImageType });
+  const { acceptedItems, duplicateItems } = await buildWeaverGraphicsDuplicatePlan(mappedItems);
+
+  if (!mappedItems.length) {
+    const err = new Error("no_importable_weaver_records");
+    err.status = 400;
+    throw err;
+  }
+
+  const results = [];
+  const promotedDuplicateItems = [];
+  const capturedDuplicateItems = [];
+  duplicateItems.forEach((item) => {
+    const isFpi = normalizeText(item.imageType).toUpperCase() === "FPI";
+    const primaryIsDifferentType = normalizeText(item.primaryImageType).toUpperCase() !== "FPI";
+    const primaryIsTemporaryPigId = normalizeKey(item.primaryImageId).startsWith("pig-");
+    const canPromoteFpiDuplicate = ["driveLink", "imageUrl", "sourceCompletionId"].includes(item.duplicateMatchType);
+    if (isFpi && canPromoteFpiDuplicate && (primaryIsDifferentType || primaryIsTemporaryPigId)) {
+      promotedDuplicateItems.push({
+        ...item,
+        imageUrl: item.primaryImageUrl || item.imageUrl,
+        remoteIngestMode: item.primaryImageUrl ? "preserve_image_url" : "",
+      });
+      return;
+    }
+    capturedDuplicateItems.push(item);
+  });
+
+  for (const item of [...acceptedItems, ...promotedDuplicateItems].slice(0, 500)) {
+    try {
+      const result = await upsertContentLibraryItem("graphics", item, actor);
+      results.push({
+        ok: true,
+        id: result.item?.id || "",
+        created: !!result.created,
+        promotedDuplicate: promotedDuplicateItems.includes(item),
+        duplicateOfImageId: item.primaryImageId || "",
+      });
+    } catch (err) {
+      results.push({
+        ok: false,
+        id: deriveContentDocId("graphics", item) || "",
+        error: err.message || "import_failed",
+      });
+    }
+  }
+
+  let capturedDuplicateCount = 0;
+  for (const duplicate of capturedDuplicateItems.slice(0, 500)) {
+    const capture = await createContentDuplicateForItem(duplicate, {
+      imageId: duplicate.primaryImageId,
+      title: duplicate.primaryTitle,
+      author: duplicate.primaryAuthor,
+      book: duplicate.primaryBook,
+      driveLink: duplicate.primaryDriveLink,
+    }, actor, {
+      source: "weaver_import",
+      duplicateMatchType: duplicate.duplicateMatchType,
+      duplicateFingerprint: duplicate.duplicateFingerprint,
+      note: "Captured as a duplicate during the Weaver -> Poetry Please import pipeline.",
+    });
+    if (capture.ok) {
+      capturedDuplicateCount += 1;
+    }
+  }
+
+  const createdCount = results.filter((row) => row.ok && row.created).length;
+  const updatedCount = results.filter((row) => row.ok && !row.created).length;
+  const errorCount = results.filter((row) => !row.ok).length;
+  if (createdCount || updatedCount) {
+    invalidateContentCache();
+    await invalidateScoreboardSnapshot("content_weaver_import:graphics");
+  }
+
+  return {
+    ok: true,
+    sourceCount: sourceRecords.length,
+    eligibleCount: eligibleRecords.length,
+    mappedCount: mappedItems.length,
+    duplicateCount: duplicateItems.length,
+    promotedDuplicateCount: promotedDuplicateItems.length,
+    capturedDuplicateCount,
+    createdCount,
+    updatedCount,
+    errorCount,
+    results,
+    duplicateItems: capturedDuplicateItems,
+    promotedDuplicateItems: promotedDuplicateItems.map((item) => ({
+      imageId: item.imageId,
+      duplicateOfImageId: item.primaryImageId,
+      duplicateMatchType: item.duplicateMatchType,
+    })),
+  };
+}
+
+function flattenWeaverExcerptRecords(rawPayload) {
+  if (Array.isArray(rawPayload)) return rawPayload;
+  if (Array.isArray(rawPayload?.records)) return rawPayload.records;
+  if (Array.isArray(rawPayload?.items)) return rawPayload.items;
+  if (Array.isArray(rawPayload?.excerpts)) return rawPayload.excerpts;
+  return rawPayload && typeof rawPayload === "object" ? [rawPayload] : [];
+}
+
+function resolveExcerptBookShortener(item = {}) {
+  const explicit = sanitizeDocIdSegment(item.bookShortener);
+  if (explicit) return explicit.toUpperCase();
+  return sanitizeDocIdSegment(resolveCanonicalCatalogMetadata(item).bookShortener || "").toUpperCase();
+}
+
+function buildWeaverExcerptImportItem(record = {}) {
+  const sourceRecordId = normalizeText(record.sourceRecordId || record.excerptHash || record.recordId || record.id || record.ledgerId);
+  return {
+    imageType: "EXC",
+    sourceSystem: normalizeText(record.sourceSystem || "weaver"),
+    sourceRecordId,
+    excerptHash: normalizeText(record.excerptHash || sourceRecordId),
+    sourceUrl: normalizeText(record.sourceUrl || record.weaverUrl || record.url),
+    sourceContentId: normalizeText(record.sourceContentId || record.relatedGraphicId || ""),
+    author: normalizeText(record.author),
+    book: normalizeText(record.book || record.bookTitle),
+    title: normalizeText(record.poem || record.poemTitle || record.title),
+    poem: normalizeText(record.poem || record.poemTitle || record.title),
+    excerpt: normalizeText(record.excerpt || record.excerptText || record.text),
+    normalizedExcerpt: normalizeText(record.normalizedExcerpt),
+    pageNumber: normalizeText(record.pageNumber),
+    bookShortener: normalizeText(record.bookShortener),
+    bookLink: normalizeText(record.bookLink),
+    releaseCatalog: normalizeText(record.releaseCatalog),
+    sourceEvent: normalizeText(record.sourceEvent),
+    sourceEventLabel: normalizeText(record.sourceEventLabel),
+    driveLink: normalizeText(record.driveLink),
+    approvedAt: normalizeText(record.approvedAt),
+    sourceUpdatedAt: normalizeText(record.updatedAt),
+  };
+}
+
+function assignCanonicalExcerptIds(items = []) {
+  const grouped = new Map();
+  items.forEach((item, index) => {
+    const bookShortener = resolveExcerptBookShortener(item);
+    if (!bookShortener || !item.poem) return;
+    const key = `${bookShortener}|${slugify(item.poem)}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push({ item, index, bookShortener });
+  });
+
+  grouped.forEach((entries) => {
+    entries.forEach(({ item, bookShortener }, idx) => {
+      const baseId = `${bookShortener}-EXC-${slugify(item.poem)}`.toUpperCase();
+      const docId = entries.length > 1 ? `${baseId}-${idx + 1}` : baseId;
+      item.docId = docId;
+      item.imageId = docId;
+      item.imageID = docId;
+      item.bookShortener = bookShortener;
+    });
+  });
+  return items;
+}
+
+function isWeaverExcerptImportType(value = "") {
+  const normalized = normalizeKey(value);
+  return normalized === "exc" || normalized === "excerpt" || normalized === "excerpts";
+}
+
+function isWeaverFullPoemImportType(value = "") {
+  const normalized = normalizeKey(value);
+  return normalized === "fp" || normalized === "fullpoem" || normalized === "fullpoems";
+}
+
+function looksLikeDirectWeaverExcerptPayload(body = {}) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  return !!(
+    body.excerpt
+    || body.excerptText
+    || body.text
+    || body.normalizedExcerpt
+    || body.excerptHash
+    || body.poemTitle
+  );
+}
+
+function looksLikeDirectWeaverGraphicPayload(body = {}) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  return !!firstNonEmpty(
+    body.driveLink,
+    body.assetLinkUrl,
+    body.assetUrl,
+    body.publicUrl,
+    body.storageUrl,
+    body.imageUrl,
+    body.url
+  );
+}
+
+function buildWeaverFullPoemImportItem(record = {}) {
+  const sourceRecordId = normalizeText(record.sourceRecordId || record.recordId || record.id || record.ledgerId);
+  return {
+    imageType: "FP",
+    sourceSystem: normalizeText(record.sourceSystem || "weaver"),
+    sourceRecordId,
+    sourceUrl: normalizeText(record.sourceUrl || record.weaverUrl || record.url),
+    sourceContentId: normalizeText(record.sourceContentId || record.relatedGraphicId || ""),
+    author: normalizeText(record.author),
+    book: normalizeText(record.book || record.bookTitle),
+    title: normalizeText(record.poem || record.poemTitle || record.title),
+    excerpt: normalizeText(record.excerpt || record.excerptText || record.text),
+    pageNumber: normalizeText(record.pageNumber),
+    bookShortener: normalizeText(record.bookShortener),
+    bookLink: normalizeText(record.bookLink),
+    releaseCatalog: normalizeText(record.releaseCatalog),
+    sourceEvent: normalizeText(record.sourceEvent),
+    sourceEventLabel: normalizeText(record.sourceEventLabel),
+    driveLink: normalizeText(record.driveLink),
+    approvedAt: normalizeText(record.approvedAt),
+    sourceUpdatedAt: normalizeText(record.updatedAt),
+  };
+}
+
+async function assignPersistentWeaverFullPoemIds(items = []) {
+  const usedIds = new Set();
+  for (const item of items) {
+    const bookShortener = resolveExcerptBookShortener(item);
+    if (!bookShortener || !item.title) continue;
+    item.bookShortener = bookShortener;
+
+    const sourceRecordId = normalizeText(item.sourceRecordId);
+    if (sourceRecordId) {
+      const existingBySource = await db.collection(COLLECTIONS.fullPoems)
+        .where("sourceRecordId", "==", sourceRecordId)
+        .limit(1)
+        .get();
+      if (!existingBySource.empty) {
+        item.docId = existingBySource.docs[0].id;
+        item.imageId = item.docId;
+        item.imageID = item.docId;
+        usedIds.add(item.docId);
+        continue;
+      }
+    }
+
+    const baseId = `${sanitizeDocIdSegment(bookShortener)}-FP-${slugify(item.title)}`.toUpperCase();
+    let nextId = baseId;
+    let index = 1;
+    while (usedIds.has(nextId)) {
+      index += 1;
+      nextId = `${baseId}-${index}`;
+    }
+    item.docId = nextId;
+    item.imageId = nextId;
+    item.imageID = nextId;
+    usedIds.add(nextId);
+  }
+  return items;
+}
+
+async function assignPersistentWeaverExcerptIds(items = []) {
+  const usedIds = new Set();
+  for (const item of items) {
+    if (!item.docId || !item.bookShortener || !item.poem) continue;
+
+    const sourceRecordId = normalizeText(item.sourceRecordId);
+    const excerptHash = normalizeText(item.excerptHash);
+    const sourceField = sourceRecordId ? "sourceRecordId" : (excerptHash ? "excerptHash" : "");
+    const sourceValue = sourceRecordId || excerptHash;
+    if (sourceField && sourceValue) {
+      const existingBySource = await db.collection(COLLECTIONS.excerpts)
+        .where(sourceField, "==", sourceValue)
+        .limit(1)
+        .get();
+      if (!existingBySource.empty) {
+        item.docId = existingBySource.docs[0].id;
+        item.imageId = item.docId;
+        item.imageID = item.docId;
+        usedIds.add(item.docId);
+        continue;
+      }
+    }
+
+    const baseId = `${sanitizeDocIdSegment(item.bookShortener)}-EXC-${slugify(item.poem)}`.toUpperCase();
+    const requestedId = sanitizeDocIdSegment(item.docId).toUpperCase();
+    const suffixMatch = requestedId.match(/-(\d+)$/);
+    let nextId = requestedId || baseId;
+    let index = suffixMatch ? Number(suffixMatch[1]) : 1;
+    while (usedIds.has(nextId) || (await db.collection(COLLECTIONS.excerpts).doc(nextId).get()).exists) {
+      index += 1;
+      nextId = `${baseId}-${index}`;
+    }
+    item.docId = nextId;
+    item.imageId = nextId;
+    item.imageID = nextId;
+    usedIds.add(nextId);
+  }
+  return items;
+}
+
+async function importWeaverExcerptsPayload(rawPayload, actor = {}) {
+  const sourceRecords = flattenWeaverExcerptRecords(rawPayload);
+  const mappedItems = await assignPersistentWeaverExcerptIds(
+    assignCanonicalExcerptIds(sourceRecords.map(buildWeaverExcerptImportItem))
+  );
+  const importableItems = mappedItems.filter((item) => item.docId && item.author && item.book && item.poem && item.excerpt);
+  if (!importableItems.length) {
+    const err = new Error("no_importable_weaver_excerpt_records");
+    err.status = 400;
+    throw err;
+  }
+
+  const results = [];
+  for (const item of importableItems.slice(0, 500)) {
+    try {
+      const result = await upsertContentLibraryItem("excerpts", item, actor);
+      results.push({ ok: true, id: result.item?.id || item.docId, created: !!result.created });
+    } catch (err) {
+      results.push({
+        ok: false,
+        id: deriveContentDocId("excerpts", item) || item.docId || "",
+        error: err.message || "import_failed",
+      });
+    }
+  }
+
+  const createdCount = results.filter((row) => row.ok && row.created).length;
+  const updatedCount = results.filter((row) => row.ok && !row.created).length;
+  const errorCount = results.filter((row) => !row.ok).length;
+  if (createdCount || updatedCount) {
+    invalidateContentCache();
+    await invalidateScoreboardSnapshot("content_weaver_import:excerpts");
+  }
+
+  return {
+    ok: true,
+    sourceCount: sourceRecords.length,
+    eligibleCount: importableItems.length,
+    mappedCount: importableItems.length,
+    createdCount,
+    updatedCount,
+    errorCount,
+    results,
+  };
+}
+
+async function importWeaverFullPoemsPayload(rawPayload, actor = {}) {
+  const sourceRecords = flattenWeaverExcerptRecords(rawPayload);
+  const mappedItems = await assignPersistentWeaverFullPoemIds(sourceRecords.map(buildWeaverFullPoemImportItem));
+  const importableItems = mappedItems.filter((item) => item.docId && item.author && item.book && item.title && item.excerpt);
+  if (!importableItems.length) {
+    const err = new Error("no_importable_weaver_full_poem_records");
+    err.status = 400;
+    throw err;
+  }
+
+  const results = [];
+  for (const item of importableItems.slice(0, 500)) {
+    try {
+      const result = await upsertContentLibraryItem("fullpoems", item, actor);
+      results.push({ ok: true, id: result.item?.id || item.docId, created: !!result.created });
+    } catch (err) {
+      results.push({
+        ok: false,
+        id: deriveContentDocId("fullpoems", item) || item.docId || "",
+        error: err.message || "import_failed",
+      });
+    }
+  }
+
+  const createdCount = results.filter((row) => row.ok && row.created).length;
+  const updatedCount = results.filter((row) => row.ok && !row.created).length;
+  const errorCount = results.filter((row) => !row.ok).length;
+  if (createdCount || updatedCount) {
+    invalidateContentCache();
+    await invalidateScoreboardSnapshot("content_weaver_import:fullpoems");
+  }
+
+  return {
+    ok: true,
+    sourceCount: sourceRecords.length,
+    eligibleCount: importableItems.length,
+    mappedCount: importableItems.length,
+    createdCount,
+    updatedCount,
+    errorCount,
+    results,
+  };
+}
+
+app.post(getBoth("/internal/catalogFullPoemSync"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+
+  try {
+    const requestedBook = normalizeText(req.body?.book);
+    const apply = req.body?.apply === true;
+    const catalogRecord = resolveCatalogBookRecord({ book: requestedBook });
+    if (!catalogRecord || normalizeText(catalogRecord.entityType || "book") !== "book") {
+      return res.status(404).json({ error: "canonical_book_not_found" });
+    }
+    if (normalizeCatalogLookupKey(catalogRecord.title) === "flee") {
+      return res.status(400).json({ error: "fiction_book_not_supported" });
+    }
+
+    const poems = await fetchCanonicalPoems(catalogRecord.title);
+    const existing = (await getAllFrom(COLLECTIONS.fullPoems))
+      .filter((row) => normalizeCatalogLookupKey(row.book) === normalizeCatalogLookupKey(catalogRecord.title));
+    const existingTitleCounts = new Map();
+    existing.forEach((row) => {
+      const key = normalizeCatalogLookupKey(row.title);
+      existingTitleCounts.set(key, (existingTitleCounts.get(key) || 0) + 1);
+    });
+
+    const seenTitleCounts = new Map();
+    const missing = [];
+    poems.forEach((poem) => {
+      const title = normalizeText(poem.title);
+      const titleKey = normalizeCatalogLookupKey(title);
+      const occurrence = (seenTitleCounts.get(titleKey) || 0) + 1;
+      seenTitleCounts.set(titleKey, occurrence);
+      if ((existingTitleCounts.get(titleKey) || 0) >= occurrence) return;
+      const baseId = `${sanitizeDocIdSegment(catalogRecord.bookShortener)}-FP-${slugify(title)}`.toUpperCase();
+      missing.push({
+        docId: occurrence > 1 ? `${baseId}-${occurrence}` : baseId,
+        imageType: "FP",
+        sourceSystem: "button_poetry_catalog",
+        sourceRecordId: `catalog-poem:${poem.id}`,
+        author: catalogRecord.author,
+        book: catalogRecord.title,
+        title,
+        excerpt: normalizeText(poem.served_text || poem.cleaned_text || poem.text),
+        bookShortener: catalogRecord.bookShortener,
+        bookLink: catalogRecord.bookLink,
+        releaseCatalog: catalogRecord.releaseCatalog,
+      });
+    });
+
+    const results = [];
+    if (apply) {
+      for (const item of missing) {
+        const result = await upsertContentLibraryItem("fullpoems", item, {
+          uid: "catalog-sync",
+          email: "catalog-sync@poetryplease.org",
+        });
+        results.push({ id: item.docId, created: !!result.created });
+      }
+      if (results.length) {
+        invalidateContentCache();
+        await invalidateScoreboardSnapshot("catalog_full_poem_sync");
+      }
+    }
+
+    canonicalPoemCountCache.set(normalizeCatalogLookupKey(catalogRecord.title), {
+      builtAt: Date.now(),
+      count: poems.length,
+    });
+    res.json({
+      ok: true,
+      book: catalogRecord.title,
+      catalogPoemCount: poems.length,
+      existingFpCount: existing.length,
+      missingFpCount: missing.length,
+      appliedCount: results.length,
+      missing: missing.map((row) => ({ id: row.docId, title: row.title })),
+    });
+  } catch (err) {
+    console.error("catalog_full_poem_sync_failed", err);
+    res.status(err.status || 500).json({ error: err.message || "catalog_full_poem_sync_failed" });
+  }
+});
+
+app.post(getBoth("/admin/contentLibrary/weaverImport"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  try {
+    const sourceUrl = normalizeText(req.body?.sourceUrl);
+    const defaultImageType = normalizeText(req.body?.imageType || "QI").toUpperCase();
+    const rawPayload = await fetchRemoteJson(sourceUrl);
+    const result = await importWeaverGraphicsPayload(rawPayload, defaultImageType, {
+      uid: ctx.decoded.uid,
+      email: ctx.decoded.email,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || "weaver_import_failed" });
+  }
+});
+
+app.post(getBoth("/internal/weaverImport"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+
+  const requestedSchemaVersion = normalizeText(req.body?.schemaVersion);
+  const schemaVersion = requestedSchemaVersion || "legacy";
+  if (requestedSchemaVersion && requestedSchemaVersion !== "1") {
+    return res.status(400).json({
+      error: "unsupported_schema_version",
+      schemaVersion: requestedSchemaVersion,
+      supportedSchemaVersions: ["1"],
+    });
+  }
+
+  const ledgerRef = db.collection(COLLECTIONS.weaverImportLedger).doc();
+  const startedAt = Date.now();
+  await ledgerRef.set({
+    status: "processing",
+    schemaVersion,
+    sourceSystem: "weaver",
+    requestedContentType: normalizeText(req.body?.contentType || req.body?.imageType || ""),
+    sourceUrl: normalizeText(req.body?.sourceUrl),
+    startedAt: FieldValue.serverTimestamp(),
+  });
+
+  try {
+    const rawPayload = req.body?.payload
+      || req.body?.records
+      || req.body?.items
+      || req.body?.excerpts
+      || (normalizeText(req.body?.sourceUrl) ? await fetchRemoteJson(req.body.sourceUrl) : null);
+    const firstPayloadRecord = Array.isArray(rawPayload) ? rawPayload[0] : rawPayload;
+    const defaultImageType = normalizeText(
+      req.body?.contentType
+      || req.body?.imageType
+      || firstPayloadRecord?.contentType
+      || firstPayloadRecord?.imageType
+      || "QI"
+    ).toUpperCase();
+    const isTextImport = isWeaverExcerptImportType(defaultImageType) || isWeaverFullPoemImportType(defaultImageType);
+    const payload = rawPayload
+      || (isTextImport && looksLikeDirectWeaverExcerptPayload(req.body) ? req.body : null)
+      || (!isTextImport && looksLikeDirectWeaverGraphicPayload(req.body) ? req.body : null);
+    if (!payload) {
+      return res.status(400).json({ error: "missing_weaver_payload" });
+    }
+
+    const actor = {
+      uid: "weaver-automation",
+      email: "weaver-automation@buttonpoetry.com",
+    };
+    const result = isWeaverExcerptImportType(defaultImageType)
+      ? await importWeaverExcerptsPayload(payload, actor)
+      : isWeaverFullPoemImportType(defaultImageType)
+        ? await importWeaverFullPoemsPayload(payload, actor)
+        : await importWeaverGraphicsPayload(payload, defaultImageType, actor);
+    const outcomes = [
+      ...(result.results || []).map((row) => ({
+        contentId: normalizeText(row.id),
+        outcome: row.ok ? (row.created ? "created" : "updated") : "failed",
+        error: normalizeText(row.error),
+      })),
+      ...(result.duplicateItems || []).map((row) => ({
+        contentId: normalizeText(row.primaryImageId || row.duplicateOfImageId || row.imageId),
+        incomingContentId: normalizeText(row.imageId),
+        outcome: "duplicate",
+        matchType: normalizeText(row.duplicateMatchType),
+      })),
+    ].slice(0, 500);
+    await ledgerRef.set({
+      status: result.errorCount ? "completed_with_errors" : "completed",
+      contentType: defaultImageType,
+      sourceCount: Number(result.sourceCount || 0),
+      eligibleCount: Number(result.eligibleCount || 0),
+      mappedCount: Number(result.mappedCount || 0),
+      createdCount: Number(result.createdCount || 0),
+      updatedCount: Number(result.updatedCount || 0),
+      duplicateCount: Number(result.duplicateCount || 0),
+      errorCount: Number(result.errorCount || 0),
+      outcomes,
+      durationMs: Date.now() - startedAt,
+      completedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+    res.json({ ...result, importLedgerId: ledgerRef.id, schemaVersion });
+  } catch (err) {
+    await ledgerRef.set({
+      status: "failed",
+      error: err.message || "weaver_import_failed",
+      durationMs: Date.now() - startedAt,
+      completedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+    res.status(err.status || 400).json({
+      error: err.message || "weaver_import_failed",
+      importLedgerId: ledgerRef.id,
+      schemaVersion,
+    });
+  }
+});
+
+async function buildWeaverImportReconciliation(limit = 100) {
+  const [ledgerSnap, allContent] = await Promise.all([
+    db.collection(COLLECTIONS.weaverImportLedger).orderBy("startedAt", "desc").limit(limit).get(),
+    getAllContentCached(),
+  ]);
+  const contentIds = new Set();
+  allContent.forEach((item) => {
+    [item.id, item.imageId, item.contentId].map(normalizeKey).filter(Boolean).forEach((id) => contentIds.add(id));
+  });
+  const ledgers = ledgerSnap.docs.map((doc) => {
+    const row = { id: doc.id, ...(doc.data() || {}) };
+    const outcomes = Array.isArray(row.outcomes) ? row.outcomes : [];
+    const missing = outcomes
+      .filter((outcome) => outcome.outcome !== "failed" && normalizeText(outcome.contentId))
+      .filter((outcome) => !contentIds.has(normalizeKey(outcome.contentId)))
+      .map((outcome) => ({
+        contentId: outcome.contentId,
+        incomingContentId: outcome.incomingContentId || "",
+        outcome: outcome.outcome,
+      }));
+    return { ...row, missingCount: missing.length, missing };
+  });
+  return {
+    ok: true,
+    checkedLedgerCount: ledgers.length,
+    gapCount: ledgers.reduce((sum, row) => sum + row.missingCount, 0),
+    failedRequestCount: ledgers.filter((row) => row.status === "failed").length,
+    ledgers,
+  };
+}
+
+app.get(getBoth("/internal/weaverImportHealth"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) return res.status(401).json({ error: "invalid_api_key" });
+  try {
+    res.json(await buildWeaverImportReconciliation(Math.max(1, Math.min(Number(req.query?.limit) || 100, 250))));
+  } catch (err) {
+    res.status(500).json({ error: "weaver_import_health_failed", message: err.message || "unknown_error" });
+  }
+});
+
+app.post(getBoth("/internal/repairWaguespackSpelling"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) return res.status(401).json({ error: "invalid_api_key" });
+  const correctedAuthor = "Francis Dylan Waguespack";
+  const collections = [
+    COLLECTIONS.graphics,
+    COLLECTIONS.excerpts,
+    COLLECTIONS.fullPoems,
+    COLLECTIONS.videos,
+    COLLECTIONS.contentSubmissions,
+  ];
+  const updatedByCollection = {};
+  let updatedCount = 0;
+  for (const collection of collections) {
+    const snap = await db.collection(collection).get();
+    const matches = snap.docs.filter((doc) => normalizeKey(doc.data()?.author) === "francis dylan waguespeck");
+    for (let start = 0; start < matches.length; start += 400) {
+      const batch = db.batch();
+      matches.slice(start, start + 400).forEach((doc) => batch.set(doc.ref, {
+        author: correctedAuthor,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true }));
+      await batch.commit();
+    }
+    updatedByCollection[collection] = matches.length;
+    updatedCount += matches.length;
+  }
+  const profileSnap = await db.collection(COLLECTIONS.authorProfiles).limit(1000).get();
+  const profileMatches = profileSnap.docs.filter((doc) => {
+    const profile = doc.data() || {};
+    return normalizeKey(profile.displayName || profile.name) === "francis dylan waguespeck"
+      || (profile.authorNameVariants || []).some((name) => normalizeKey(name) === "francis dylan waguespeck");
+  });
+  for (const doc of profileMatches) {
+    const profile = doc.data() || {};
+    await doc.ref.set({
+      displayName: canonicalizeAuthorName(profile.displayName || profile.name),
+      authorNameVariants: uniq((profile.authorNameVariants || []).map(canonicalizeAuthorName)),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
+  updatedByCollection[COLLECTIONS.authorProfiles] = profileMatches.length;
+  updatedCount += profileMatches.length;
+  invalidateContentCache();
+  await invalidateScoreboardSnapshot("repair_waguespack_spelling");
+  res.json({ ok: true, correctedAuthor, updatedCount, updatedByCollection });
+});
+
+app.get(getBoth("/internal/coverageCounts"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+
+  try {
+    const requestedLane = normalizeText(req.query?.lane || req.query?.type || "QI").toUpperCase();
+    const result = requestedLane === "INT_FPI"
+      ? await buildInternalIntFpiCoveragePayload()
+      : await buildInternalCoverageCountsPayload(requestedLane);
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || "coverage_counts_failed" });
+  }
+});
+
+app.get(getBoth("/internal/contentScores"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+
+  try {
+    const result = await buildInternalContentScoresPayload(req.query?.type || "FPI");
+    res.json(result);
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || "content_scores_failed" });
+  }
+});
+
+app.get(getBoth("/internal/userCoverage"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+
+  const email = normalizeText(req.query?.email).toLowerCase();
+  const contentType = normalizeText(req.query?.type || "FP").toUpperCase();
+  const releaseCatalog = normalizeText(req.query?.catalog || "");
+  if (!email) return res.status(400).json({ error: "missing_email" });
+
+  try {
+    const [allContent, votes, flaggedIds] = await Promise.all([
+      getAllContentCached(),
+      getAllVotes(),
+      getFlaggedContentIds(),
+    ]);
+    const matching = allContent.filter((item) => (
+      normalizeText(item.imageType).toUpperCase() === contentType
+      && (!releaseCatalog || normalizeKey(item.releaseCatalog) === normalizeKey(releaseCatalog))
+      && normalizeText(item.imageId)
+    ));
+    const eligible = matching.filter((item) => !flaggedIds.has(normalizeKey(item.imageId)));
+    const votedIds = new Set(
+      votes
+        .filter((vote) => normalizeText(vote.userId).toLowerCase() === email)
+        .map((vote) => normalizeKey(vote.imageId))
+        .filter(Boolean)
+    );
+    const remaining = eligible.filter((item) => !votedIds.has(normalizeKey(item.imageId)));
+
+    res.json({
+      ok: true,
+      email,
+      contentType,
+      releaseCatalog,
+      scoreboardTotal: matching.length,
+      flaggedCount: matching.length - eligible.length,
+      eligibleTotal: eligible.length,
+      votedEligibleCount: eligible.filter((item) => votedIds.has(normalizeKey(item.imageId))).length,
+      remainingCount: remaining.length,
+      remaining: remaining.slice(0, 100).map((item) => ({
+        imageId: item.imageId,
+        title: item.title || "",
+        book: item.book || "",
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: "user_coverage_failed", message: err.message || "unknown_error" });
+  }
+});
+
+app.get(getBoth("/internal/contentFlagAudit"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+
+  const contentType = normalizeText(req.query?.type || "").toUpperCase();
+  const status = normalizeText(req.query?.status || "pending").toLowerCase();
+  try {
+    const snap = await db.collection(COLLECTIONS.contentFlags).limit(1000).get();
+    const flags = snap.docs
+      .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
+      .filter((flag) => !contentType || normalizeText(flag.imageType).toUpperCase() === contentType)
+      .filter((flag) => !status || normalizeText(flag.status || "pending").toLowerCase() === status)
+      .sort((a, b) => timestampToMs(b.createdAt) - timestampToMs(a.createdAt))
+      .map((flag) => ({
+        id: flag.id,
+        imageId: flag.imageId || "",
+        imageType: flag.imageType || "",
+        title: flag.title || "",
+        author: flag.author || "",
+        book: flag.book || "",
+        releaseCatalog: flag.releaseCatalog || "",
+        qualityLane: flag.qualityLane || "",
+        note: flag.note || "",
+        status: flag.status || "pending",
+        resolution: flag.resolution || "",
+        reviewNote: flag.reviewNote || "",
+        flaggedByEmail: flag.flaggedByEmail || "",
+        createdAt: flag.createdAt || null,
+      }));
+    res.json({ ok: true, contentType, status, count: flags.length, flags });
+  } catch (err) {
+    res.status(500).json({ error: "content_flag_audit_failed", message: err.message || "unknown_error" });
+  }
+});
+
+app.get(getBoth("/internal/contentSnapshotHealth"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+
+  try {
+    const startedAt = Date.now();
+    const snapshot = await readContentSnapshot();
+    if (!snapshot) {
+      return res.json({
+        ok: true,
+        available: false,
+        storagePath: CONTENT_SNAPSHOT_PATH,
+        version: CONTENT_SNAPSHOT_VERSION,
+        snapshotReadDurationMs: Date.now() - startedAt,
+        memoryCache: {
+          available: Array.isArray(contentCache.payload),
+          contentCount: Array.isArray(contentCache.payload) ? contentCache.payload.length : 0,
+          ageMs: contentCache.builtAt ? Math.max(Date.now() - contentCache.builtAt, 0) : null,
+        },
+      });
+    }
+    const ageMs = Math.max(Date.now() - snapshot.builtAtMs, 0);
+    res.json({
+      ok: true,
+      available: true,
+      readable: true,
+      storagePath: CONTENT_SNAPSHOT_PATH,
+      version: CONTENT_SNAPSHOT_VERSION,
+      builtAtMs: snapshot.builtAtMs,
+      ageMs,
+      ttlMs: CONTENT_SNAPSHOT_TTL_MS,
+      stale: ageMs >= CONTENT_SNAPSHOT_TTL_MS,
+      contentCount: snapshot.payload.length,
+      snapshotReadDurationMs: Date.now() - startedAt,
+      memoryCache: {
+        available: Array.isArray(contentCache.payload),
+        contentCount: Array.isArray(contentCache.payload) ? contentCache.payload.length : 0,
+        ageMs: contentCache.builtAt ? Math.max(Date.now() - contentCache.builtAt, 0) : null,
+      },
+    });
+  } catch (err) {
+    console.error("Content snapshot health check failed", err);
+    res.status(500).json({
+      ok: false,
+      error: "content_snapshot_health_failed",
+      message: err.message || "unknown_error",
+    });
+  }
+});
+
+app.get(getBoth("/internal/contentDuplicateAudit"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+
+  try {
+    const limit = Math.max(1, Math.min(Number(req.query?.limit) || 250, 500));
+    const duplicates = await getEnrichedContentDuplicateRows(limit);
+    res.json({ ok: true, count: duplicates.length, duplicates });
+  } catch (err) {
+    console.error("Content duplicate audit failed", err);
+    res.status(500).json({ error: "content_duplicate_audit_failed", message: err.message || "unknown_error" });
+  }
+});
+
+app.post(getBoth("/internal/contentDuplicateAudit/pruneMissing"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+
+  try {
+    const duplicates = await getEnrichedContentDuplicateRows(500);
+    const staleRows = duplicates.filter((row) => !row.capturedContentFound || !row.primaryContentFound);
+    const dryRun = req.body?.dryRun !== false;
+    if (!dryRun) {
+      for (let index = 0; index < staleRows.length; index += 400) {
+        const batch = db.batch();
+        staleRows.slice(index, index + 400).forEach((row) => {
+          batch.delete(db.collection(COLLECTIONS.contentDuplicates).doc(row.id));
+        });
+        await batch.commit();
+      }
+    }
+    res.json({
+      ok: true,
+      dryRun,
+      checkedCount: duplicates.length,
+      removedCount: dryRun ? 0 : staleRows.length,
+      staleCount: staleRows.length,
+    });
+  } catch (err) {
+    console.error("Content duplicate prune failed", err);
+    res.status(500).json({ error: "content_duplicate_prune_failed", message: err.message || "unknown_error" });
+  }
+});
+
+app.get(getBoth("/internal/excerptDuplicateCandidates"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+
+  const snap = await db.collection(COLLECTIONS.excerpts).get();
+  const groups = new Map();
+  snap.docs.forEach((doc) => {
+    const data = doc.data() || {};
+    const fingerprint = buildExcerptFingerprint(data.excerpt);
+    if (!fingerprint) return;
+    groups.set(fingerprint, [...(groups.get(fingerprint) || []), {
+      id: doc.id,
+      imageId: data.imageId || data.imageID || doc.id,
+      author: data.author || "",
+      book: data.book || "",
+      title: data.poem || data.title || "",
+      excerpt: data.excerpt || "",
+      releaseCatalog: data.releaseCatalog || "",
+      bookShortener: data.bookShortener || "",
+    }]);
+  });
+
+  const duplicateGroups = Array.from(groups.entries())
+    .filter(([, items]) => items.length > 1)
+    .map(([fingerprint, items]) => ({ fingerprint, items }));
+  res.json({
+    ok: true,
+    checkedCount: snap.size,
+    duplicateGroupCount: duplicateGroups.length,
+    duplicateItemCount: duplicateGroups.reduce((sum, group) => sum + group.items.length - 1, 0),
+    groups: duplicateGroups,
+  });
+});
+
+app.post(getBoth("/internal/resolveExcerptDuplicates"), async (req, res) => {
+  if (!hasValidPoetryPleaseApiKey(req)) {
+    return res.status(401).json({ error: "invalid_api_key" });
+  }
+  if (normalizeText(req.body?.confirm) !== "DELETE_CATALOG_MISMATCHED_EXCERPTS") {
+    return res.status(400).json({ error: "confirmation_required" });
+  }
+
+  const resolutions = Array.isArray(req.body?.resolutions) ? req.body.resolutions.slice(0, 250) : [];
+  if (!resolutions.length) return res.status(400).json({ error: "missing_resolutions" });
+
+  const results = [];
+  let deletedExcerptCount = 0;
+  let migratedVoteCount = 0;
+  let removedRedundantVoteCount = 0;
+  let resolvedLedgerCount = 0;
+
+  for (const resolution of resolutions) {
+    const keepId = normalizeText(resolution?.keepId);
+    const deleteIds = uniq(resolution?.deleteIds || []).filter((id) => id && id !== keepId).slice(0, 25);
+    if (!keepId || !deleteIds.length) {
+      results.push({ ok: false, keepId, error: "invalid_resolution" });
+      continue;
+    }
+
+    const keepRef = db.collection(COLLECTIONS.excerpts).doc(keepId);
+    const [keepSnap, ...deleteSnaps] = await Promise.all([
+      keepRef.get(),
+      ...deleteIds.map((id) => db.collection(COLLECTIONS.excerpts).doc(id).get()),
+    ]);
+    if (!keepSnap.exists || deleteSnaps.some((snap) => !snap.exists)) {
+      results.push({ ok: false, keepId, deleteIds, error: "excerpt_not_found" });
+      continue;
+    }
+
+    const keepFingerprint = buildExcerptFingerprint(keepSnap.data()?.excerpt);
+    const mismatched = deleteSnaps.find((snap) => buildExcerptFingerprint(snap.data()?.excerpt) !== keepFingerprint);
+    if (!keepFingerprint || mismatched) {
+      results.push({ ok: false, keepId, deleteIds, error: "excerpt_text_not_equivalent" });
+      continue;
+    }
+
+    const voteDocs = [];
+    for (const imageId of [keepId, ...deleteIds]) {
+      const voteSnap = await db.collection(COLLECTIONS.votes).where("imageId", "==", imageId).get();
+      voteSnap.docs.forEach((doc) => voteDocs.push(doc));
+    }
+    const votesByUser = new Map();
+    voteDocs.forEach((doc) => {
+      const data = doc.data() || {};
+      const userKey = normalizeKey(data.userId || data.email || `vote:${doc.id}`);
+      votesByUser.set(userKey, [...(votesByUser.get(userKey) || []), doc]);
+    });
+
+    for (const docs of votesByUser.values()) {
+      docs.sort((a, b) => timestampToMs(b.data()?.timestamp) - timestampToMs(a.data()?.timestamp));
+      const winner = docs[0];
+      if (normalizeText(winner.data()?.imageId) !== keepId) {
+        await winner.ref.set({ imageId: keepId }, { merge: true });
+        migratedVoteCount += 1;
+      }
+      for (const redundant of docs.slice(1)) {
+        await redundant.ref.delete();
+        removedRedundantVoteCount += 1;
+      }
+    }
+
+    await Promise.all(deleteSnaps.map((snap) => snap.ref.delete()));
+    deletedExcerptCount += deleteSnaps.length;
+
+    const ledgerRefs = new Map();
+    for (const deleteId of deleteIds) {
+      const [capturedSnap, primarySnap] = await Promise.all([
+        db.collection(COLLECTIONS.contentDuplicates).where("imageId", "==", deleteId).get(),
+        db.collection(COLLECTIONS.contentDuplicates).where("duplicateOfImageId", "==", deleteId).get(),
+      ]);
+      [...capturedSnap.docs, ...primarySnap.docs].forEach((doc) => ledgerRefs.set(doc.id, doc.ref));
+    }
+    for (const ref of ledgerRefs.values()) {
+      await ref.set({
+        status: "confirmed_duplicate",
+        reviewDecision: "catalog_cleanup",
+        reviewNote: `Catalog formatting retained in ${keepId}.`,
+        reviewedBy: "internal_catalog_cleanup",
+        reviewedAt: FieldValue.serverTimestamp(),
+        moderationHistory: FieldValue.arrayUnion(buildDuplicateHistoryEntry(
+          "duplicate_resolved",
+          { uid: "internal_catalog_cleanup", email: "" },
+          `Catalog formatting retained in ${keepId}.`,
+          { reviewDecision: "catalog_cleanup", primaryImageId: keepId }
+        )),
+      }, { merge: true });
+      resolvedLedgerCount += 1;
+    }
+
+    results.push({ ok: true, keepId, deletedIds: deleteIds });
+  }
+
+  if (deletedExcerptCount || migratedVoteCount || removedRedundantVoteCount) {
+    invalidateContentCache();
+    ratingsCache.builtAt = 0;
+    ratingsCache.payload = null;
+    ratingsCache.inFlight = null;
+    await invalidateScoreboardSnapshot("catalog_excerpt_duplicate_cleanup");
+  }
+
+  res.json({
+    ok: true,
+    resolutionCount: results.filter((row) => row.ok).length,
+    errorCount: results.filter((row) => !row.ok).length,
+    deletedExcerptCount,
+    migratedVoteCount,
+    removedRedundantVoteCount,
+    resolvedLedgerCount,
+    results,
+  });
+});
+
+app.post(getBoth("/admin/contentLibrary/deleteByIds"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const type = normalizeKey(req.body?.type);
+  const collection = collectionForContentType(type);
+  const ids = uniq(req.body?.ids || []);
+  if (!collection) return res.status(400).json({ error: "invalid_content_type" });
+  if (!ids.length) return res.status(400).json({ error: "missing_ids" });
+
+  const deleted = [];
+  const missing = [];
+  for (const id of ids.slice(0, 500)) {
+    const resolved = await resolveContentRefForDelete(collection, id, type);
+    if (!resolved?.ref) {
+      missing.push(id);
+      continue;
+    }
+    await resolved.ref.delete();
+    deleted.push(id);
+  }
+  if (deleted.length) {
+    invalidateContentCache();
+    await invalidateScoreboardSnapshot(`content_delete:${type}`);
+  }
+  res.json({ ok: true, deletedCount: deleted.length, missingCount: missing.length, deleted, missing });
+});
+
+app.post(getBoth("/admin/contentLibrary/deleteByDate"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const type = normalizeKey(req.body?.type);
+  const collection = collectionForContentType(type);
+  const targetDate = normalizeText(req.body?.targetDate);
+  if (!collection) return res.status(400).json({ error: "invalid_content_type" });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) return res.status(400).json({ error: "invalid_target_date" });
+
+  const snap = await db.collection(collection).limit(1000).get();
+  const matches = snap.docs.filter((doc) => {
+    if (type === "youtube" && normalizeKey(doc.data()?.imageType) !== "yt") return false;
+    const createdAt = doc.data()?.createdAt;
+    const date = createdAt?.toDate ? createdAt.toDate() : (createdAt ? new Date(createdAt) : null);
+    if (!date || Number.isNaN(date.getTime())) return false;
+    return date.toISOString().slice(0, 10) === targetDate;
+  });
+
+  await Promise.all(matches.map((doc) => doc.ref.delete()));
+  if (matches.length) {
+    invalidateContentCache();
+    await invalidateScoreboardSnapshot(`content_delete_by_date:${type}:${targetDate}`);
+  }
+  res.json({ ok: true, deletedCount: matches.length, targetDate });
+});
+
+app.post(getBoth("/admin/contentFlags/:flagId/review"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["team", "admin"]);
+  if (!ctx) return;
+
+  const flagId = normalizeText(req.params.flagId);
+  const decision = normalizeText(req.body?.decision);
+  const note = normalizeText(req.body?.note || "");
+  if (!flagId) return res.status(400).json({ error: "missing_flag_id" });
+  if (!["approved", "updated"].includes(decision)) return res.status(400).json({ error: "invalid_decision" });
+
+  const flagRef = db.collection(COLLECTIONS.contentFlags).doc(flagId);
+  const snap = await flagRef.get();
+  if (!snap.exists) return res.status(404).json({ error: "flag_not_found" });
+  const flagData = snap.data() || {};
+
+  const matchingFlags = await db.collection(COLLECTIONS.contentFlags)
+    .where("imageId", "==", flagData.imageId || "")
+    .limit(25)
+    .get();
+  const targets = matchingFlags.empty ? [flagRef] : matchingFlags.docs.map((doc) => doc.ref);
+  const historyEntry = buildFlagHistoryEntry(
+    decision === "approved" ? "reapproved" : "marked_updated",
+    { uid: ctx.decoded.uid, email: ctx.decoded.email },
+    note
+  );
+  await Promise.all(targets.map((ref) => ref.set({
+    status: "resolved",
+    resolution: decision,
+    reviewNote: note,
+    reviewedBy: ctx.decoded.uid,
+    reviewedAt: FieldValue.serverTimestamp(),
+    moderationHistory: FieldValue.arrayUnion(historyEntry),
+  }, { merge: true })));
+  invalidateFlaggedContentCache();
+  await invalidateScoreboardSnapshot(`flag_reviewed:${flagData.imageId || flagId}`);
+
+  const saved = await flagRef.get();
+  res.json({ ok: true, flag: { id: saved.id, ...(saved.data() || {}) } });
+});
+
+app.post(getBoth("/admin/contentFlags/:flagId/uploadReplacement"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const flagId = normalizeText(req.params.flagId);
+  const reviewNote = normalizeText(req.body?.note || "");
+  if (!flagId) return res.status(400).json({ error: "missing_flag_id" });
+
+  let upload;
+  try {
+    upload = parseBase64Upload(req.body, UPLOAD_RULES.replacementImage);
+  } catch (err) {
+    return res.status(err.status || 400).json({ error: err.message || "invalid_upload" });
+  }
+
+  const flagRef = db.collection(COLLECTIONS.contentFlags).doc(flagId);
+  const flagSnap = await flagRef.get();
+  if (!flagSnap.exists) return res.status(404).json({ error: "flag_not_found" });
+  const flag = flagSnap.data() || {};
+  if ((flag.status || "") !== "pending") return res.status(409).json({ error: "flag_not_pending" });
+
+  const contentRecord = await findContentRecordByImageId(flag.imageId || "");
+  if (!contentRecord) return res.status(404).json({ error: "content_not_found" });
+  if (contentRecord.collection !== COLLECTIONS.graphics) {
+    return res.status(400).json({ error: "replacement_supported_for_graphics_only" });
+  }
+
+  const storagePath = `content-replacements/${normalizeKey(flag.imageId || contentRecord.docId)}/${Date.now()}.${upload.extension}`;
+  const { publicUrl } = await saveImageUpload({
+    storagePath,
+    mimeType: upload.mimeType,
+    buffer: upload.buffer,
+  });
+  const assetRef = db.collection(COLLECTIONS.contentAssets).doc();
+  await assetRef.set({
+    assetType: "replacement_graphic",
+    sourceFlagId: flagId,
+    imageId: flag.imageId || "",
+    contentCollection: contentRecord.collection,
+    contentDocId: contentRecord.docId,
+    storagePath,
+    publicUrl,
+    width: upload.width,
+    height: upload.height,
+    fileSize: upload.fileSize,
+    mimeType: upload.mimeType,
+    uploadedByUid: ctx.decoded.uid,
+    uploadedByEmail: ctx.decoded.email,
+    status: "active",
+    createdAt: FieldValue.serverTimestamp(),
+  });
+
+  await db.collection(contentRecord.collection).doc(contentRecord.docId).set({
+    imageUrl: publicUrl,
+    updatedAt: FieldValue.serverTimestamp(),
+    updatedBy: ctx.decoded.uid,
+    replacementAssetId: assetRef.id,
+  }, { merge: true });
+
+  const matchingFlags = await db.collection(COLLECTIONS.contentFlags)
+    .where("imageId", "==", flag.imageId || "")
+    .limit(25)
+    .get();
+  const targets = matchingFlags.empty ? [flagRef] : matchingFlags.docs.map((doc) => doc.ref);
+  const historyEntry = buildFlagHistoryEntry(
+    "asset_replaced",
+    { uid: ctx.decoded.uid, email: ctx.decoded.email },
+    reviewNote,
+    {
+      replacementAssetId: assetRef.id,
+      replacementUrl: publicUrl,
+    }
+  );
+  await Promise.all(targets.map((ref) => ref.set({
+    status: "resolved",
+    resolution: "updated",
+    reviewNote,
+    replacementAssetId: assetRef.id,
+    replacementUrl: publicUrl,
+    reviewedBy: ctx.decoded.uid,
+    reviewedAt: FieldValue.serverTimestamp(),
+    moderationHistory: FieldValue.arrayUnion(historyEntry),
+  }, { merge: true })));
+  await invalidateScoreboardSnapshot(`flag_replaced:${flag.imageId || flagId}`);
+
+  const saved = await flagRef.get();
+  res.json({
+    ok: true,
+    assetId: assetRef.id,
+    publicUrl,
+    flag: { id: saved.id, ...(saved.data() || {}) },
+  });
+});
+
+app.get(getBoth("/admin/contentClaims"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const snap = await db.collection(COLLECTIONS.contentClaims).limit(250).get();
+  const claims = snap.docs
+    .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
+    .sort((a, b) => (b.createdAt?._seconds || 0) - (a.createdAt?._seconds || 0));
+  res.json({ claims });
+});
+
+app.post(getBoth("/admin/contentClaims/:claimId/review"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const claimId = normalizeText(req.params.claimId);
+  const decision = normalizeText(req.body?.decision);
+  const note = normalizeText(req.body?.note || "");
+  if (!claimId) return res.status(400).json({ error: "missing_claim_id" });
+  if (!["approved", "rejected"].includes(decision)) return res.status(400).json({ error: "invalid_decision" });
+
+  const claimRef = db.collection(COLLECTIONS.contentClaims).doc(claimId);
+  const claimSnap = await claimRef.get();
+  if (!claimSnap.exists) return res.status(404).json({ error: "claim_not_found" });
+  const claim = claimSnap.data() || {};
+
+  await claimRef.set({
+    status: decision,
+    reviewNote: note,
+    reviewedAt: FieldValue.serverTimestamp(),
+    reviewedBy: ctx.decoded.uid,
+  }, { merge: true });
+
+  if (decision === "approved") {
+    const profileId = claim.profileId || claim.requesterUid;
+    const profileRef = db.collection(COLLECTIONS.authorProfiles).doc(profileId);
+    const profileSnap = await profileRef.get();
+    const existingProfile = profileSnap.exists ? (profileSnap.data() || {}) : {};
+    await profileRef.set({
+      userId: existingProfile.userId || claim.requesterUid,
+      email: existingProfile.email || claim.requesterEmail,
+      displayName: existingProfile.displayName || claim.requesterEmail,
+      slug: existingProfile.slug || slugify(existingProfile.displayName || claim.requesterEmail),
+      authorNameVariants: uniq(existingProfile.authorNameVariants || []),
+      claimedContentIds: uniq([...(existingProfile.claimedContentIds || []), claim.imageId]),
+      createdAt: existingProfile.createdAt || FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+      published: existingProfile.published ?? false,
+    }, { merge: true });
+
+    await db.collection(COLLECTIONS.users).doc(claim.requesterUid).set({
+      authorProfileId: profileId,
+      roles: resolveRoles([...(Array.isArray(claim.roles) ? claim.roles : ["user", "author"]), "author"], claim.requesterEmail || ""),
+    }, { merge: true });
+  }
+
+  const saved = await claimRef.get();
+  res.json({ ok: true, claim: { id: saved.id, ...(saved.data() || {}) } });
+});
+
+async function getEnrichedContentDuplicateRows(limit = 250) {
+  const [snap, allContent] = await Promise.all([
+    db.collection(COLLECTIONS.contentDuplicates).limit(limit).get(),
+    getAllContentCached(),
+  ]);
+  const contentById = new Map();
+  allContent.forEach((item) => {
+    [item.id, item.imageId, item.contentId].map(normalizeKey).filter(Boolean).forEach((key) => {
+      if (!contentById.has(key)) contentById.set(key, item);
+    });
+  });
+  return snap.docs
+    .map(mapContentDuplicateDoc)
+    .map((row) => {
+      const captured = contentById.get(normalizeKey(row.imageId));
+      const primary = contentById.get(normalizeKey(row.duplicateOfImageId));
+      return {
+        ...row,
+        capturedContentFound: !!captured,
+        primaryContentFound: !!primary,
+        capturedImageType: captured?.imageType || row.imageType || "",
+        primaryImageType: primary?.imageType || "",
+        capturedActualTitle: captured?.title || "",
+        primaryActualTitle: primary?.title || "",
+        capturedActualAuthor: captured?.author || "",
+        primaryActualAuthor: primary?.author || "",
+        capturedActualBook: captured?.book || "",
+        primaryActualBook: primary?.book || "",
+        capturedActualCatalog: captured?.releaseCatalog || "",
+        primaryActualCatalog: primary?.releaseCatalog || "",
+      };
+    })
+    .sort((a, b) => (normalizeTimestamp(b.createdAt)?.getTime() || 0) - (normalizeTimestamp(a.createdAt)?.getTime() || 0));
+}
+
+app.get(getBoth("/admin/contentDuplicates"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const duplicates = await getEnrichedContentDuplicateRows(250);
+  res.json({ duplicates });
+});
+
+app.post(getBoth("/admin/contentDuplicates/scanExcerpts"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const snap = await db.collection(COLLECTIONS.excerpts).get();
+  const rows = snap.docs
+    .map((doc) => ({ id: doc.id, ref: doc.ref, ...(doc.data() || {}) }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const groups = new Map();
+  const backfillWrites = [];
+
+  rows.forEach((row) => {
+    const fingerprint = buildExcerptFingerprint(row.excerpt);
+    if (!fingerprint) return;
+    if (row.excerptFingerprint !== fingerprint) {
+      backfillWrites.push({ ref: row.ref, fingerprint });
+    }
+    groups.set(fingerprint, [...(groups.get(fingerprint) || []), row]);
+  });
+
+  for (let offset = 0; offset < backfillWrites.length; offset += 400) {
+    const batch = db.batch();
+    backfillWrites.slice(offset, offset + 400).forEach(({ ref, fingerprint }) => {
+      batch.set(ref, { excerptFingerprint: fingerprint }, { merge: true });
+    });
+    await batch.commit();
+  }
+
+  const duplicateGroups = Array.from(groups.entries()).filter(([, matches]) => matches.length > 1);
+  let capturedCount = 0;
+  let alreadyCapturedCount = 0;
+  for (const [fingerprint, matches] of duplicateGroups) {
+    const primary = matches[0];
+    for (const duplicate of matches.slice(1)) {
+      const capture = await createContentDuplicateForItem({
+        ...duplicate,
+        imageId: duplicate.imageId || duplicate.imageID || duplicate.id,
+        title: duplicate.poem || duplicate.title || "",
+      }, {
+        imageId: primary.imageId || primary.imageID || primary.id,
+        title: primary.poem || primary.title || "",
+        author: primary.author || "",
+        book: primary.book || "",
+        driveLink: primary.driveLink || "",
+      }, {
+        uid: ctx.decoded.uid,
+        email: ctx.decoded.email,
+      }, {
+        duplicateMatchType: "exactExcerptText",
+        duplicateFingerprint: fingerprint,
+        note: "Found during the Admin exact-text EXC duplicate scan.",
+        source: "admin_excerpt_scan",
+      });
+      if (capture.ok) capturedCount += 1;
+      else if (capture.reason === "already_captured") alreadyCapturedCount += 1;
+    }
+  }
+
+  res.json({
+    ok: true,
+    checkedCount: rows.length,
+    duplicateGroupCount: duplicateGroups.length,
+    duplicateItemCount: duplicateGroups.reduce((sum, [, matches]) => sum + matches.length - 1, 0),
+    capturedCount,
+    alreadyCapturedCount,
+    fingerprintBackfillCount: backfillWrites.length,
+  });
+});
+
+app.get(getBoth("/admin/weaverExcHealth"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const snap = await db.collection(COLLECTIONS.excerpts).limit(1000).get();
+  const excerpts = snap.docs.map((doc) => ({ id: doc.id, ...(doc.data() || {}) }));
+  const weaverRows = excerpts
+    .filter((row) => normalizeKey(row.sourceSystem) === "weaver" || normalizeText(row.sourceRecordId || row.excerptHash))
+    .map((row) => {
+      const idShortener = sanitizeDocIdSegment(String(row.imageId || row.id || "").split("-")[0] || "");
+      const catalog = resolveCanonicalCatalogMetadata({
+        author: row.author || "",
+        book: row.book || "",
+        bookShortener: row.bookShortener || idShortener,
+      });
+      return {
+        ...row,
+        book: catalog.book || row.book || "",
+        bookShortener: catalog.bookShortener || row.bookShortener || idShortener,
+        releaseCatalog: normalizeText(row.releaseCatalog || catalog.releaseCatalog || ""),
+      };
+    });
+  const missingCatalog = weaverRows.filter((row) => !normalizeText(row.releaseCatalog));
+  const duplicateGroups = new Map();
+  weaverRows.forEach((row) => {
+    const key = normalizeText(row.normalizedExcerpt || row.excerptHash || "").toLowerCase();
+    if (!key) return;
+    duplicateGroups.set(key, [...(duplicateGroups.get(key) || []), row]);
+  });
+  const possibleDuplicates = Array.from(duplicateGroups.values())
+    .filter((rows) => rows.length > 1)
+    .slice(0, 25)
+    .map((rows) => ({
+      count: rows.length,
+      ids: rows.map((row) => row.imageId || row.id).slice(0, 8),
+      title: rows[0]?.poem || rows[0]?.title || "",
+      book: rows[0]?.book || "",
+      author: rows[0]?.author || "",
+    }));
+  const recent = weaverRows
+    .sort((a, b) => (normalizeTimestamp(b.updatedAt)?.getTime() || 0) - (normalizeTimestamp(a.updatedAt)?.getTime() || 0))
+    .slice(0, 25)
+    .map((row) => ({
+      id: row.imageId || row.id,
+      title: row.poem || row.title || "",
+      author: row.author || "",
+      book: row.book || "",
+      releaseCatalog: row.releaseCatalog || "",
+      sourceRecordId: row.sourceRecordId || "",
+      excerptHash: row.excerptHash || "",
+      updatedAt: row.updatedAt || null,
+    }));
+  res.json({
+    ok: true,
+    checkedCount: excerpts.length,
+    weaverExcCount: weaverRows.length,
+    missingCatalogCount: missingCatalog.length,
+    possibleDuplicateGroupCount: possibleDuplicates.length,
+    missingCatalog: missingCatalog.slice(0, 25).map((row) => ({
+      id: row.imageId || row.id,
+      title: row.poem || row.title || "",
+      author: row.author || "",
+      book: row.book || "",
+      sourceRecordId: row.sourceRecordId || "",
+    })),
+    possibleDuplicates,
+    recent,
+  });
+});
+
+app.get(getBoth("/admin/weaverImportHealth"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  try {
+    res.json(await buildWeaverImportReconciliation(100));
+  } catch (err) {
+    res.status(500).json({ error: "weaver_import_health_failed", message: err.message || "unknown_error" });
+  }
+});
+
+app.post(getBoth("/admin/contentDuplicates/:duplicateId/review"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const duplicateId = normalizeText(req.params.duplicateId);
+  const decision = normalizeKey(req.body?.decision);
+  const note = normalizeText(req.body?.note || "");
+  if (!duplicateId) return res.status(400).json({ error: "missing_duplicate_id" });
+  if (!["confirmed", "dismissed"].includes(decision)) return res.status(400).json({ error: "invalid_decision" });
+
+  const duplicateRef = db.collection(COLLECTIONS.contentDuplicates).doc(duplicateId);
+  const snap = await duplicateRef.get();
+  if (!snap.exists) return res.status(404).json({ error: "duplicate_not_found" });
+  const existing = snap.data() || {};
+  if ((existing.status || "pending") !== "pending") return res.status(409).json({ error: "duplicate_not_pending" });
+
+  const historyEntry = buildDuplicateHistoryEntry(
+    decision === "confirmed" ? "duplicate_confirmed" : "duplicate_dismissed",
+    { uid: ctx.decoded.uid, email: ctx.decoded.email },
+    note,
+    { reviewDecision: decision }
+  );
+
+  await duplicateRef.set({
+    status: decision === "confirmed" ? "confirmed_duplicate" : "dismissed",
+    reviewDecision: decision,
+    reviewNote: note,
+    reviewedBy: ctx.decoded.uid,
+    reviewedAt: FieldValue.serverTimestamp(),
+    moderationHistory: FieldValue.arrayUnion(historyEntry),
+  }, { merge: true });
+
+  const saved = await duplicateRef.get();
+  res.json({ ok: true, duplicate: mapContentDuplicateDoc(saved) });
+});
+
+app.post(getBoth("/authorInvites/create"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const email = normalizeKey(req.body?.email);
+  if (!email) return res.status(400).json({ error: "missing_email" });
+  const token = randomBytes(24).toString("hex");
+  const inviteRef = db.collection(COLLECTIONS.authorInvites).doc();
+  const expiresInDays = Math.max(1, Number(req.body?.expiresInDays || 14));
+  const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000);
+
+  await inviteRef.set({
+    email,
+    createdBy: ctx.decoded.uid,
+    createdAt: FieldValue.serverTimestamp(),
+    expiresAt,
+    claimedAt: null,
+    claimedByUserId: "",
+    status: "active",
+    tokenHash: sha256(token),
+  });
+
+  res.json({
+    ok: true,
+    inviteId: inviteRef.id,
+    inviteUrl: `https://poetryplease.org/app?authorInvite=${token}`,
+    email,
+    expiresAt: expiresAt.toISOString(),
+  });
+});
+
+app.post(getBoth("/admin/authorInvites/:inviteId/regenerate"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const inviteId = normalizeText(req.params.inviteId);
+  if (!inviteId) return res.status(400).json({ error: "missing_invite_id" });
+  const inviteRef = db.collection(COLLECTIONS.authorInvites).doc(inviteId);
+  const inviteSnap = await inviteRef.get();
+  if (!inviteSnap.exists) return res.status(404).json({ error: "invite_not_found" });
+  const invite = inviteSnap.data() || {};
+  if (invite.status === "claimed" || normalizeText(invite.claimedByUserId)) {
+    return res.status(409).json({ error: "invite_already_claimed" });
+  }
+
+  const token = randomBytes(24).toString("hex");
+  const expiresInDays = Math.max(1, Number(req.body?.expiresInDays || 14));
+  const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000);
+  await inviteRef.set({
+    tokenHash: sha256(token),
+    expiresAt,
+    status: "active",
+    regeneratedAt: FieldValue.serverTimestamp(),
+    regeneratedBy: ctx.decoded.uid,
+  }, { merge: true });
+
+  res.json({
+    ok: true,
+    inviteId,
+    email: invite.email || "",
+    expiresAt: expiresAt.toISOString(),
+    inviteUrl: `https://poetryplease.org/app?authorInvite=${token}`,
+  });
+});
+
+app.post(getBoth("/authorInvites/redeem"), async (req, res) => {
+  const ctx = await requireDecodedUser(req, res);
+  if (!ctx) return;
+
+  const token = normalizeText(req.body?.token);
+  if (!token) return res.status(400).json({ error: "missing_token" });
+  const tokenHash = sha256(token);
+  const snap = await db
+    .collection(COLLECTIONS.authorInvites)
+    .where("tokenHash", "==", tokenHash)
+    .where("status", "==", "active")
+    .limit(1)
+    .get();
+  if (snap.empty) return res.status(404).json({ error: "invite_not_found" });
+
+  const inviteDoc = snap.docs[0];
+  const invite = inviteDoc.data() || {};
+  const inviteEmail = normalizeKey(invite.email);
+  if (inviteEmail !== normalizeKey(ctx.decoded.email)) {
+    return res.status(403).json({ error: "email_mismatch", inviteEmail });
+  }
+  if (invite.expiresAt?.toDate && invite.expiresAt.toDate() < new Date()) {
+    return res.status(410).json({ error: "invite_expired" });
+  }
+
+  const userRef = db.collection(COLLECTIONS.users).doc(ctx.decoded.uid);
+  const userSnap = await userRef.get();
+  const userData = userSnap.data() || {};
+  const profileId = userData.authorProfileId || ctx.decoded.uid;
+  const profileRef = db.collection(COLLECTIONS.authorProfiles).doc(profileId);
+  const profileSnap = await profileRef.get();
+  const displayName = normalizeText(
+    profileSnap.data()?.displayName || ctx.decoded.name || userData.displayName || ctx.decoded.email
+  );
+
+  await profileRef.set(
+    {
+      userId: ctx.decoded.uid,
+      email: ctx.decoded.email,
+      displayName,
+      slug: slugify(profileSnap.data()?.slug || displayName),
+      authorNameVariants: uniq(profileSnap.data()?.authorNameVariants || [displayName]),
+      published: profileSnap.data()?.published ?? false,
+      createdAt: profileSnap.data()?.createdAt || FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await userRef.set(
+    {
+      email: ctx.decoded.email,
+      displayName,
+      authorProfileId: profileRef.id,
+      roles: [...new Set([...(userData.roles || ["user"]), "author"])],
+      lastLoginAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+
+  await inviteDoc.ref.set(
+    {
+      status: "claimed",
+      claimedAt: FieldValue.serverTimestamp(),
+      claimedByUserId: ctx.decoded.uid,
+    },
+    { merge: true }
+  );
+
+  const savedProfile = await profileRef.get();
+  res.json({ ok: true, profile: mapProfileDoc(savedProfile.id, savedProfile.data()) });
+});
+
+app.get(getBoth("/admin/authorProfiles"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const snap = await db.collection(COLLECTIONS.authorProfiles).limit(250).get();
+  const profiles = snap.docs
+    .map((doc) => mapProfileDoc(doc.id, doc.data()))
+    .sort((a, b) => String(a.displayName || a.slug || "").localeCompare(String(b.displayName || b.slug || ""), undefined, { sensitivity: "base" }));
+  res.json({ profiles });
+});
+
+function authorProfileStatus(profile = {}, invite = null, feedbackCount = 0) {
+  if (!profile?.id && invite?.status === "claimed") return "claimed";
+  if (!profile?.id && invite) return invite.status === "expired" ? "invite expired" : "invited";
+  if (!profile?.id) return "not invited";
+  if (!profile.userId) return "profile incomplete";
+  if (!profile.published) return "ready for review";
+  if (feedbackCount > 0) return "needs feedback review";
+  return "published";
+}
+
+function profileReadiness(profile = {}, associatedCount = 0, feedbackCount = 0) {
+  profile = profile || {};
+  return {
+    hasClaimedAccount: !!profile.userId,
+    hasBio: !!normalizeText(profile.bio || profile.shortBio),
+    hasLinks: [profile.websiteUrl, profile.instagramUrl, profile.tiktokUrl, profile.youtubeUrl, profile.newsletterUrl, profile.bookstoreUrl]
+      .some(normalizeText) || (Array.isArray(profile.customLinks) && profile.customLinks.length > 0),
+    hasFeaturedOrFallback: (profile.featuredContentIds || []).length > 0 || associatedCount > 0,
+    published: !!profile.published,
+    unresolvedFeedbackCount: feedbackCount,
+  };
+}
+
+app.get(getBoth("/admin/authorCommandCenter"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const [profileSnap, inviteSnap, flagSnap, allContent] = await Promise.all([
+    db.collection(COLLECTIONS.authorProfiles).limit(250).get(),
+    db.collection(COLLECTIONS.authorInvites).limit(250).get(),
+    db.collection(COLLECTIONS.contentFlags).limit(250).get(),
+    getAllContentCached(),
+  ]);
+
+  const profiles = profileSnap.docs.map((doc) => mapProfileDoc(doc.id, doc.data()));
+  const invites = inviteSnap.docs.map((doc) => {
+    const data = doc.data() || {};
+    const expiresAt = data.expiresAt?.toDate ? data.expiresAt.toDate() : (data.expiresAt || null);
+    const claimedAt = data.claimedAt?.toDate ? data.claimedAt.toDate() : (data.claimedAt || null);
+    const status = data.status === "claimed" ? "claimed" : ((expiresAt && expiresAt < new Date()) ? "expired" : (data.status || "active"));
+    return {
+      id: doc.id,
+      email: data.email || "",
+      status,
+      createdAt: data.createdAt || null,
+      expiresAt: expiresAt ? expiresAt.toISOString() : null,
+      claimedAt: claimedAt ? claimedAt.toISOString() : null,
+      claimedByUserId: data.claimedByUserId || "",
+    };
+  });
+
+  const claimedUserIds = uniq(invites.map((invite) => invite.claimedByUserId).filter(Boolean));
+  const claimedUsers = new Map(await Promise.all(claimedUserIds.map(async (userId) => {
+    const userSnap = await db.collection(COLLECTIONS.users).doc(userId).get();
+    return [userId, userSnap.data() || {}];
+  })));
+  const profileById = new Map(profiles.map((profile) => [profile.id, profile]));
+  const profileByEmail = new Map(profiles.filter((profile) => normalizeKey(profile.email)).map((profile) => [normalizeKey(profile.email), profile]));
+  const inviteByEmail = new Map(invites.filter((invite) => normalizeKey(invite.email)).map((invite) => [normalizeKey(invite.email), invite]));
+  const inviteByProfileId = new Map();
+  invites.forEach((invite) => {
+    const user = claimedUsers.get(invite.claimedByUserId) || {};
+    const profileId = user.authorProfileId || invite.claimedByUserId || "";
+    if (profileId) inviteByProfileId.set(profileId, { ...invite, claimedByEmail: user.email || "" });
+  });
+
+  const contentById = new Map(allContent.map((item) => [normalizeKey(item.imageId || item.contentId || ""), item]));
+  const feedbackByAuthor = new Map();
+  flagSnap.docs.forEach((doc) => {
+    const flag = doc.data() || {};
+    if ((flag.status || "pending") !== "pending") return;
+    if (!String(flag.note || "").includes("Author review note")) return;
+    const match = String(flag.note || "").match(/Author profile:\s*(.+)/);
+    const author = normalizeText(match?.[1]?.split("\n")?.[0] || flag.author || "Unknown author");
+    const key = normalizeKey(author);
+    const rows = feedbackByAuthor.get(key) || [];
+    rows.push({
+      id: doc.id,
+      imageId: flag.imageId || "",
+      reason: flag.reason || "",
+      note: flag.note || "",
+      createdAt: flag.createdAt || null,
+      title: flag.title || flag.currentTitle || "",
+      author: flag.author || "",
+    });
+    feedbackByAuthor.set(key, rows);
+  });
+
+  const associatedCounts = new Map();
+  const associatedSamples = new Map();
+  profiles.forEach((profile) => {
+    const authorKeys = new Set([profile.displayName, ...(profile.authorNameVariants || [])].map(normalizeKey).filter(Boolean));
+    const claimedKeys = new Set((profile.claimedContentIds || []).map(normalizeKey));
+    const matches = allContent.filter((item) => authorKeys.has(normalizeKey(item.author)) || claimedKeys.has(normalizeKey(item.imageId || item.contentId)));
+    associatedCounts.set(profile.id, matches.length);
+    associatedSamples.set(profile.id, matches.slice(0, 8).map((item) => ({
+      id: item.imageId || item.contentId || "",
+      title: item.title || item.poem || "",
+      book: item.book || "",
+      type: item.imageType || "",
+      catalog: item.releaseCatalog || "",
+    })));
+  });
+
+  const rowsByKey = new Map();
+  profiles.forEach((profile) => {
+    const invite = inviteByProfileId.get(profile.id) || inviteByEmail.get(normalizeKey(profile.email)) || null;
+    const associatedCount = associatedCounts.get(profile.id) || 0;
+    const feedbackRows = (profile.authorNameVariants || [profile.displayName]).flatMap((name) => feedbackByAuthor.get(normalizeKey(name)) || []);
+    const feedbackCount = feedbackRows.length;
+    const featuredSample = (profile.featuredContentIds || []).slice(0, 8).map((id) => {
+      const item = contentById.get(normalizeKey(id)) || {};
+      return {
+        id,
+        title: item.title || item.poem || "",
+        book: item.book || "",
+        type: item.imageType || "",
+      };
+    });
+    rowsByKey.set(`profile:${profile.id}`, {
+      profile,
+      invite,
+      status: authorProfileStatus(profile, invite, feedbackCount),
+      associatedCount,
+      associatedSample: associatedSamples.get(profile.id) || [],
+      featuredSample,
+      feedbackNotes: feedbackRows.slice(0, 8),
+      readiness: profileReadiness(profile, associatedCount, feedbackCount),
+    });
+  });
+
+  invites.forEach((invite) => {
+    const user = claimedUsers.get(invite.claimedByUserId) || {};
+    const profile = profileById.get(user.authorProfileId || invite.claimedByUserId || "") || profileByEmail.get(normalizeKey(invite.email)) || null;
+    if (profile) return;
+    rowsByKey.set(`invite:${invite.id}`, {
+      profile: null,
+      invite: { ...invite, claimedByEmail: user.email || "" },
+      status: authorProfileStatus(null, invite),
+      associatedCount: 0,
+      associatedSample: [],
+      featuredSample: [],
+      feedbackNotes: [],
+      readiness: profileReadiness(null, 0, 0),
+    });
+  });
+
+  const rows = Array.from(rowsByKey.values()).sort((a, b) => {
+    const aName = a.profile?.displayName || a.invite?.email || "";
+    const bName = b.profile?.displayName || b.invite?.email || "";
+    return aName.localeCompare(bName, undefined, { sensitivity: "base" });
+  });
+
+  res.json({
+    ok: true,
+    summary: {
+      total: rows.length,
+      invited: rows.filter((row) => row.status === "invited").length,
+      claimed: rows.filter((row) => row.readiness.hasClaimedAccount).length,
+      readyForReview: rows.filter((row) => row.status === "ready for review").length,
+      published: rows.filter((row) => row.status === "published").length,
+      unresolvedFeedback: rows.reduce((sum, row) => sum + (row.readiness.unresolvedFeedbackCount || 0), 0),
+    },
+    rows,
+  });
+});
+
+app.get(getBoth("/admin/contentSubmissions"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const snap = await db.collection(COLLECTIONS.contentSubmissions).limit(250).get();
+  const submissions = snap.docs
+    .map(mapSubmissionDoc)
+    .sort((a, b) => (normalizeTimestamp(b.createdAt)?.getTime() || 0) - (normalizeTimestamp(a.createdAt)?.getTime() || 0));
+  res.json({ submissions });
+});
+
+app.post(getBoth("/admin/contentSubmissions/:submissionId/review"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const submissionId = normalizeText(req.params.submissionId);
+  const decision = normalizeKey(req.body?.decision);
+  const note = normalizeText(req.body?.note || "");
+  if (!submissionId) return res.status(400).json({ error: "missing_submission_id" });
+  if (!["approved", "rejected"].includes(decision)) return res.status(400).json({ error: "invalid_decision" });
+
+  const ref = db.collection(COLLECTIONS.contentSubmissions).doc(submissionId);
+  const snap = await ref.get();
+  if (!snap.exists) return res.status(404).json({ error: "submission_not_found" });
+  const existing = mapSubmissionDoc(snap);
+
+  await ref.set({
+    status: decision,
+    reviewNote: note,
+    reviewedAt: FieldValue.serverTimestamp(),
+    reviewedBy: ctx.decoded.uid,
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+
+  const saved = await ref.get();
+  res.json({ ok: true, submission: mapSubmissionDoc(saved) });
+});
+
+function resolveImportAssistantRows(rows = [], defaults = {}, imageType = "QI") {
+  return rows.slice(0, 100).map((row, index) => {
+    const fileName = normalizeText(row?.fileName || row?.sourceFileName || "");
+    const author = canonicalizeAuthorName(row?.author || defaults?.author || "");
+    const book = normalizeText(row?.book || defaults?.book || "");
+    const title = normalizeText(row?.title || "");
+    const driveLink = normalizeText(row?.driveLink || defaults?.driveFolderLink || "");
+    const catalog = resolveCanonicalCatalogMetadata({
+      author,
+      book,
+      bookShortener: row?.bookShortener || defaults?.bookShortener || "",
+      fileName,
+    });
+    const matched = catalog.match;
+    const bookShortener = sanitizeDocIdSegment(row?.bookShortener || defaults?.bookShortener || catalog.bookShortener || inferBookShortenerFromFilename(fileName));
+    const resolvedTitle = title || fileName.replace(/\.[a-z0-9]+$/i, "").trim();
+    const suppliedDocId = sanitizeDocIdSegment(row?.docId || row?.contentId || row?.imageId || "");
+    const generatedDocId = bookShortener && resolvedTitle
+      ? `${bookShortener}-${imageType}-${contentIdSlug(resolvedTitle)}`.toUpperCase()
+      : "";
+    const resolvedRow = {
+      index,
+      fileName,
+      driveLink,
+      imageType,
+      matched: !!matched,
+      author: author || catalog.author || "",
+      book: catalog.book || book || "",
+      bookLink: normalizeText(row?.bookLink || defaults?.bookLink || catalog.bookLink || ""),
+      releaseCatalog: normalizeText(row?.releaseCatalog || defaults?.releaseCatalog || catalog.releaseCatalog || ""),
+      bookShortener,
+      catalogMatchReason: catalog.matchReason || "",
+      catalogChangedFields: catalog.changedFields || [],
+      title: resolvedTitle,
+      lineNote: normalizeText(row?.lineNote || ""),
+      pageScope: normalizeText(row?.pageScope || ""),
+      pageNumber: normalizeText(row?.pageNumber || ""),
+      suppliedDocId,
+      suggestedDocId: suppliedDocId || generatedDocId,
+      folderLink: normalizeText(defaults?.driveFolderLink || ""),
+    };
+    const miscParts = [
+      resolvedRow.fileName ? `Import Assistant source file: ${resolvedRow.fileName}` : "",
+      resolvedRow.folderLink ? `Import Assistant folder: ${resolvedRow.folderLink}` : "",
+      resolvedRow.pageScope ? `pageScope=${resolvedRow.pageScope}` : "",
+      resolvedRow.lineNote ? `lineNote=${resolvedRow.lineNote}` : "",
+    ].filter(Boolean);
+    resolvedRow.contentItem = {
+      docId: resolvedRow.suggestedDocId,
+      imageId: resolvedRow.suggestedDocId,
+      imageType,
+      author: resolvedRow.author,
+      book: resolvedRow.book,
+      title: resolvedRow.title,
+      imageUrl: "",
+      driveLink: resolvedRow.driveLink,
+      bookLink: resolvedRow.bookLink,
+      releaseCatalog: resolvedRow.releaseCatalog,
+      pageNumber: resolvedRow.pageNumber,
+      bookShortener: resolvedRow.bookShortener,
+      misc: miscParts.join(" · "),
+    };
+    return resolvedRow;
+  });
+}
+
+function finalizeImportAssistantGraphicRow(row, remoteMedia = null) {
+  const effectiveFileName = normalizeText(row?.fileName || remoteMedia?.fileName || "");
+  const effectiveTitle = normalizeText(row?.title || effectiveFileName.replace(/\.[a-z0-9]+$/i, "").trim());
+  const explicitDocId = normalizeText(row?.suggestedDocId || "");
+  const effectiveDocId = explicitDocId || (row?.bookShortener && effectiveTitle
+    ? `${row.bookShortener}-${row.imageType}-${contentIdSlug(effectiveTitle)}`.toUpperCase()
+    : "");
+  const miscParts = [
+    effectiveFileName ? `Import Assistant source file: ${effectiveFileName}` : "",
+    row?.folderLink ? `Import Assistant folder: ${row.folderLink}` : "",
+    row?.pageScope ? `pageScope=${row.pageScope}` : "",
+    row?.lineNote ? `lineNote=${row.lineNote}` : "",
+  ].filter(Boolean);
+  return {
+    ...row,
+    fileName: effectiveFileName,
+    title: effectiveTitle,
+    suggestedDocId: effectiveDocId,
+    contentItem: {
+      ...(row?.contentItem || {}),
+      docId: effectiveDocId,
+      imageId: effectiveDocId,
+      title: effectiveTitle,
+      driveLink: normalizeText(row?.driveLink || ""),
+      pageNumber: normalizeText(row?.pageNumber || ""),
+      bookShortener: normalizeText(row?.bookShortener || ""),
+      misc: miscParts.join(" · "),
+    },
+  };
+}
+
+app.post(getBoth("/admin/importAssistant/resolve"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  const imageType = normalizeText(req.body?.imageType || "QI") || "QI";
+  const resolved = resolveImportAssistantRows(rows, req.body?.defaults || {}, imageType);
+  res.json({ resolved });
+});
+
+app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  const imageType = normalizeText(req.body?.imageType || "QI") || "QI";
+  const resolved = resolveImportAssistantRows(rows, req.body?.defaults || {}, imageType);
+  const results = [];
+  const usedDocIds = new Set();
+  const existingGraphics = await getAdminContentDocs(COLLECTIONS.graphics, { searchMode: true });
+  for (const row of resolved) {
+    let resolvedRow = finalizeImportAssistantGraphicRow(row);
+    let item = resolvedRow.contentItem || {};
+    const assigned = await assignImportAssistantGraphicDocId(resolvedRow, usedDocIds, existingGraphics);
+    resolvedRow = assigned.row;
+    item = resolvedRow.contentItem || item;
+    let action = assigned.action || "review";
+    let validation = { ok: false, error: "missing_drive_link" };
+    if (assigned.error) {
+      validation = { ok: false, error: assigned.error };
+    } else if (item.driveLink) {
+      try {
+        const remote = await fetchRemoteMediaResponse(item.driveLink, UPLOAD_RULES.libraryGraphic, item);
+        resolvedRow = finalizeImportAssistantGraphicRow(resolvedRow, remote);
+        item = resolvedRow.contentItem || item;
+        validation = {
+          ok: true,
+          mimeType: remote.mimeType,
+          fileName: remote.fileName,
+          width: remote.width,
+          height: remote.height,
+          fileSize: remote.fileSize,
+        };
+      } catch (err) {
+        validation = { ok: false, error: err.message || "validation_failed" };
+      }
+    }
+    results.push({
+      ...resolvedRow,
+      action,
+      validation,
+    });
+  }
+
+  const createCount = results.filter((row) => row.action === "create").length;
+  const updateCount = results.filter((row) => row.action === "update").length;
+  const reviewCount = results.filter((row) => row.action === "review" || row.action === "error").length;
+  const validCount = results.filter((row) => row.validation?.ok).length;
+  const invalidCount = results.length - validCount;
+  const suffixCount = results.filter((row) => Number(row.collisionSuffixApplied || 0) > 1).length;
+  res.json({
+    ok: true,
+    rows: results,
+    createCount,
+    updateCount,
+    reviewCount,
+    validCount,
+    invalidCount,
+    suffixCount,
+    canImport: validCount > 0,
+    previewedAt: new Date().toISOString(),
+  });
+});
+
+
+app.get(getBoth("/admin/authorInvites"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const snap = await db.collection(COLLECTIONS.authorInvites).limit(250).get();
+  const rawInvites = snap.docs
+    .map((doc) => ({ id: doc.id, ...(doc.data() || {}) }))
+    .map((invite) => {
+      const expiresAt = invite.expiresAt?.toDate ? invite.expiresAt.toDate() : (invite.expiresAt || null);
+      const claimedAt = invite.claimedAt?.toDate ? invite.claimedAt.toDate() : (invite.claimedAt || null);
+      const status = invite.status === "claimed" ? "claimed" : ((expiresAt && expiresAt < new Date()) ? 'expired' : (invite.status || 'active'));
+      return {
+        id: invite.id,
+        email: invite.email || '',
+        status,
+        createdBy: invite.createdBy || '',
+        createdAt: invite.createdAt || null,
+        expiresAt: expiresAt ? expiresAt.toISOString() : null,
+        claimedAt: claimedAt ? claimedAt.toISOString() : null,
+        claimedByUserId: invite.claimedByUserId || '',
+      };
+    });
+  const claimedUserIds = uniq(rawInvites.map((invite) => invite.claimedByUserId).filter(Boolean));
+  const claimedUsers = new Map(await Promise.all(claimedUserIds.map(async (userId) => {
+    const userSnap = await db.collection(COLLECTIONS.users).doc(userId).get();
+    return [userId, userSnap.data() || {}];
+  })));
+  const profileIds = uniq(rawInvites.map((invite) => {
+    const user = claimedUsers.get(invite.claimedByUserId) || {};
+    return user.authorProfileId || invite.claimedByUserId || '';
+  }).filter(Boolean));
+  const claimedProfiles = new Map(await Promise.all(profileIds.map(async (profileId) => {
+    const profileSnap = await db.collection(COLLECTIONS.authorProfiles).doc(profileId).get();
+    return [profileId, profileSnap.exists ? mapProfileDoc(profileSnap.id, profileSnap.data()) : null];
+  })));
+  const invites = rawInvites
+    .map((invite) => {
+      const user = claimedUsers.get(invite.claimedByUserId) || {};
+      const profileId = user.authorProfileId || invite.claimedByUserId || '';
+      const profile = claimedProfiles.get(profileId) || null;
+      return {
+        ...invite,
+        claimedByEmail: user.email || '',
+        profileId,
+        profileName: profile?.displayName || '',
+        profileSlug: profile?.slug || '',
+      };
+    })
+    .sort((a, b) => {
+      const aTime = a.createdAt?._seconds || 0;
+      const bTime = b.createdAt?._seconds || 0;
+      return bTime - aTime;
+    });
+
+  res.json({ invites });
+});
+
+app.get(getBoth("/admin/users"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const queryText = normalizeKey(req.query?.q || "");
+  const [authUsers, voteStats] = await Promise.all([
+    listAllAuthUsers(1000),
+    getVoteStatsByUserId(),
+  ]);
+  const synced = await Promise.all(authUsers.map((authUser) => syncUserRecordFromAuthUser(authUser)));
+  const anonymousRows = [];
+  const namedRows = [];
+
+  synced.forEach((row) => {
+    if (!normalizeText(row.email)) anonymousRows.push(row);
+    else namedRows.push(row);
+  });
+
+  const rows = namedRows
+    .filter((row) => {
+      if (!queryText) return true;
+      const haystack = [
+        row.email,
+        row.displayName,
+        ...(Array.isArray(row.roles) ? row.roles : []),
+      ].map(normalizeKey);
+      return haystack.some((value) => value.includes(queryText));
+    })
+    .sort((a, b) => normalizeKey(a.email || a.uid).localeCompare(normalizeKey(b.email || b.uid)))
+    .map((row) => ({
+      uid: row.uid,
+      email: row.email || "",
+      displayName: row.displayName || "",
+      roles: Array.isArray(row.roles) ? row.roles : ["user"],
+      status: row.status || "active",
+      automaticTeamAccess: row.automaticTeamAccess !== false,
+      authorProfileId: row.authorProfileId || null,
+      createdAt: row.createdAt || null,
+      lastLoginAt: row.lastLoginAt || null,
+      voteCount: voteStats.get(normalizeKey(row.email || ""))?.count || 0,
+      lastAppActivityAt: voteStats.get(normalizeKey(row.email || ""))?.lastActivityAt || null,
+    }));
+
+  if (anonymousRows.length) {
+    const anonymousVoteEntries = Array.from(voteStats.entries()).filter(([key]) => key.startsWith("local-") || key.startsWith("poetrylover"));
+    const anonymousVoteCount = anonymousVoteEntries.reduce((sum, [, stat]) => sum + Number(stat?.count || 0), 0);
+    const anonymousLastActivityAt = anonymousVoteEntries.reduce((latest, [, stat]) => {
+      const latestSeconds = latest?._seconds || 0;
+      const nextSeconds = stat?.lastActivityAt?._seconds || 0;
+      return nextSeconds > latestSeconds ? stat.lastActivityAt : latest;
+    }, null);
+    const anonymousLastLoginAt = anonymousRows.reduce((latest, row) => {
+      const latestSeconds = latest?._seconds || 0;
+      const nextSeconds = row.lastLoginAt?._seconds || 0;
+      return nextSeconds > latestSeconds ? row.lastLoginAt : latest;
+    }, null);
+    const aggregateRow = {
+      uid: "__anonymous__",
+      email: "",
+      displayName: `Anonymous users (${anonymousRows.length})`,
+      roles: ["user"],
+      status: "active",
+      authorProfileId: null,
+      createdAt: null,
+      lastLoginAt: anonymousLastLoginAt,
+      voteCount: anonymousVoteCount,
+      lastAppActivityAt: anonymousLastActivityAt,
+      isAnonymousAggregate: true,
+    };
+    const haystack = [
+      aggregateRow.displayName,
+      "anonymous",
+      "local",
+    ].map(normalizeKey);
+    if (!queryText || haystack.some((value) => value.includes(queryText))) {
+      rows.push(aggregateRow);
+    }
+  }
+
+  res.json({ users: rows, syncedCount: authUsers.length });
+});
+
+app.post(getBoth("/admin/users/:uid/roles"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+
+  const uid = normalizeText(req.params.uid);
+  if (!uid) return res.status(400).json({ error: "missing_uid" });
+
+  const ref = db.collection(COLLECTIONS.users).doc(uid);
+  const snap = await ref.get();
+  if (!snap.exists) return res.status(404).json({ error: "user_not_found" });
+
+  const userData = snap.data() || {};
+  const requestedRoles = Array.isArray(req.body?.roles) ? req.body.roles : [];
+  const isButtonAccount = normalizeKey(userData.email).endsWith("@buttonpoetry.com");
+  const automaticTeamAccess = isButtonAccount
+    ? requestedRoles.map(normalizeText).includes("team")
+    : userData.automaticTeamAccess !== false;
+  const roles = sanitizeManagedRoles(requestedRoles, userData.email || "", { automaticTeamAccess });
+  await ref.set(
+    {
+      roles,
+      automaticTeamAccess,
+      updatedAt: FieldValue.serverTimestamp(),
+      updatedBy: ctx.decoded.uid,
+    },
+    { merge: true }
+  );
+
+  const saved = await ref.get();
+  res.json({
+    ok: true,
+    user: {
+      uid: saved.id,
+      ...(saved.data() || {}),
+    },
+  });
+});
+
+app.post(getBoth("/admin/users/:uid/status"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  const uid = normalizeText(req.params.uid);
+  if (!uid) return res.status(400).json({ error: "missing_uid" });
+  if (uid === ctx.decoded.uid) return res.status(400).json({ error: "cannot_disable_self" });
+
+  const disabled = req.body?.disabled === true;
+  const authUser = await auth.getUser(uid);
+  if (ADMIN_EMAILS.has(normalizeKey(authUser.email))) {
+    return res.status(400).json({ error: "cannot_disable_bootstrap_admin" });
+  }
+  await auth.updateUser(uid, { disabled });
+  const ref = db.collection(COLLECTIONS.users).doc(uid);
+  await ref.set({
+    status: disabled ? "disabled" : "active",
+    updatedAt: FieldValue.serverTimestamp(),
+    updatedBy: ctx.decoded.uid,
+  }, { merge: true });
+  const saved = await ref.get();
+  res.json({ ok: true, user: { uid, ...(saved.data() || {}) } });
 });
 
 
@@ -301,4 +8251,9 @@ app.use((req, res) => {
 });
 
 // Keep this LAST
-export const api = onRequest({ region: "us-central1" }, app);
+export const api = onRequest({
+  region: "us-central1",
+  memory: "1GiB",
+  minInstances: 1,
+  timeoutSeconds: 540,
+}, app);
