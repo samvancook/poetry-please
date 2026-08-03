@@ -668,6 +668,18 @@ async function fetchRemoteWithTimeout(url, options = {}, timeoutMs = REMOTE_FETC
   }
 }
 
+function withStageTimeout(promise, timeoutMs, errorCode, status = 504) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(errorCode);
+      err.status = status;
+      reject(err);
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function getDriveReadAccessToken() {
   const targetPrincipal = normalizeText(process.env.DRIVE_READER_SERVICE_ACCOUNT || "");
   let client;
@@ -711,7 +723,11 @@ async function fetchAuthenticatedGoogleDriveMedia(fileId, sourceUrl, rules, body
     err.status = metadataResponse.status === 404 ? 404 : 502;
     throw err;
   }
-  const metadata = await metadataResponse.json();
+  const metadata = await withStageTimeout(
+    metadataResponse.json(),
+    REMOTE_FETCH_TIMEOUT_MS,
+    "drive_metadata_parse_timeout",
+  );
   const mediaUrl = `https://www.googleapis.com/drive/v3/files/${encodedId}?alt=media&supportsAllDrives=true`;
   const response = await fetchRemoteWithTimeout(mediaUrl, { headers, redirect: "follow" });
   if (!response.ok) {
@@ -719,14 +735,18 @@ async function fetchAuthenticatedGoogleDriveMedia(fileId, sourceUrl, rules, body
     err.status = response.status === 404 ? 404 : 502;
     throw err;
   }
-  return describeRemoteMediaResponse(response, {
-    candidate: mediaUrl,
-    sourceUrl,
-    rules,
-    body,
-    fileName: normalizeText(metadata.name),
-    contentType: normalizeText(metadata.mimeType),
-  });
+  return withStageTimeout(
+    describeRemoteMediaResponse(response, {
+      candidate: mediaUrl,
+      sourceUrl,
+      rules,
+      body,
+      fileName: normalizeText(metadata.name),
+      contentType: normalizeText(metadata.mimeType),
+    }),
+    REMOTE_FETCH_TIMEOUT_MS,
+    "drive_media_probe_timeout",
+  );
 }
 
 async function fetchRemoteMediaResponse(sourceUrl, rules, body = {}) {
@@ -746,6 +766,12 @@ async function fetchRemoteMediaResponse(sourceUrl, rules, body = {}) {
       lastError = err;
       driveServiceError = err;
     }
+  }
+  // A permission or missing-file response from the authenticated Drive API is
+  // authoritative. Do not spend the remaining item deadline retrying public
+  // Drive URLs that cannot work for a non-browser service account.
+  if (driveServiceError && [403, 404].includes(Number(driveServiceError.status || 0))) {
+    throw driveServiceError;
   }
   const candidates = driveId
     ? [
@@ -822,7 +848,11 @@ async function streamRemoteMediaToStorage({ sourceUrl, storagePath, rules, body 
     writeStream.on("finish", () => finish());
     readStream.pipe(writeStream);
   });
-  const publicUrl = await getDownloadURL(file);
+  const publicUrl = await withStageTimeout(
+    getDownloadURL(file),
+    REMOTE_FETCH_TIMEOUT_MS,
+    "storage_finalize_timeout",
+  );
   return {
     ...remote,
     publicUrl,
@@ -3915,15 +3945,23 @@ async function upsertContentLibraryItem(type, body = {}, actor = {}) {
       && !preserveProvidedImageUrl
       && (!currentImageUrl || isGoogleDriveFileUrl(currentImageUrl));
     if (shouldIngestRemoteGraphic) {
-      const remoteUpload = await fetchRemoteMediaResponse(sourceUrl, UPLOAD_RULES.libraryGraphic, body);
+      const remoteUpload = await withStageTimeout(
+        fetchRemoteMediaResponse(sourceUrl, UPLOAD_RULES.libraryGraphic, body),
+        15000,
+        "remote_media_fetch_stage_timeout",
+      );
       const storagePath = `content-library/graphics/${normalizeKey(pendingDocId)}/${Date.now()}.${remoteUpload.extension}`;
-      const streamedUpload = await streamRemoteMediaToStorage({
-        sourceUrl,
-        storagePath,
-        rules: UPLOAD_RULES.libraryGraphic,
-        body,
-        remoteMedia: remoteUpload,
-      });
+      const streamedUpload = await withStageTimeout(
+        streamRemoteMediaToStorage({
+          sourceUrl,
+          storagePath,
+          rules: UPLOAD_RULES.libraryGraphic,
+          body,
+          remoteMedia: remoteUpload,
+        }),
+        25000,
+        "remote_media_stream_stage_timeout",
+      );
       uploadImageUrl = streamedUpload.publicUrl;
 
       const assetRef = db.collection(COLLECTIONS.contentAssets).doc();
@@ -4041,16 +4079,16 @@ async function upsertContentLibraryItem(type, body = {}, actor = {}) {
       throw err;
     }
   }
-  await ref.set({
+  await withStageTimeout(ref.set({
     ...existing,
     ...built.payload,
     createdAt: existing.createdAt || FieldValue.serverTimestamp(),
-  }, { merge: true });
+  }, { merge: true }), 10000, "content_write_timeout");
   if (isRename && originalSnap?.exists) {
     await originalRef.delete();
   }
 
-  const saved = await ref.get();
+  const saved = await withStageTimeout(ref.get(), 10000, "content_read_timeout");
   return {
     ok: true,
     item: mapAdminContentDoc(collection, saved),

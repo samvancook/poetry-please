@@ -2477,12 +2477,13 @@
       }
       statusEl.textContent = 'Importing valid graphics…';
       statusEl.className = 'status';
+      let batchId = '';
       try {
         const job = await api('admin/contentLibrary/importJobs', {
           method: 'POST',
           body: { type: 'graphics', items },
         });
-        const batchId = job.batchId;
+        batchId = job.batchId;
         let processPayload = null;
         do {
           processPayload = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}/process`, {
@@ -2494,10 +2495,30 @@
           statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0}/${items.length} complete, ${counts.failed || 0} failed…`;
         } while ((processPayload.counts?.pending || 0) > 0);
         const counts = processPayload.counts || {};
-        statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0} complete, ${counts.failed || 0} failed. Failed items remain available for retry.`;
+        if (counts.failed) {
+          const snapshot = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}`);
+          const failed = (snapshot.items || []).filter((item) => item.state === 'failed');
+          statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0} complete, ${counts.failed} failed — ${failed.map((item) => `${item.requestedId || item.itemId}: ${item.error || 'import_failed'}${item.status ? ` (${item.status})` : ''}`).join(' | ')}`;
+          statusEl.className = 'status error';
+        } else {
+          statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0} complete, 0 failed.`;
+        }
         document.getElementById('run-import-assistant-graphics').disabled = true;
       } catch (err) {
         console.error(err);
+        if (batchId) {
+          try {
+            const snapshot = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}`);
+            const failed = (snapshot.items || []).filter((item) => item.state === 'failed');
+            if (failed.length) {
+              statusEl.textContent = `Batch ${batchId}: ${failed.length} failed — ${failed.map((item) => `${item.requestedId || item.itemId}: ${item.error || 'import_failed'}${item.status ? ` (${item.status})` : ''}`).join(' | ')}`;
+              statusEl.className = 'status error';
+              return;
+            }
+          } catch (statusErr) {
+            console.error(statusErr);
+          }
+        }
         statusEl.textContent = err.message || 'Could not import valid graphics.';
         statusEl.className = 'status error';
       }
