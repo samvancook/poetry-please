@@ -50,7 +50,7 @@ const ADMIN_EMAILS = new Set([
 
 const FILE_SIZE_MB = 1024 * 1024;
 const REMOTE_STREAM_TIMEOUT_MS = 20 * 1000;
-const REMOTE_AUTH_TIMEOUT_MS = 4000;
+const REMOTE_AUTH_TIMEOUT_MS = 15000;
 const IMPORT_JOB_MAX_ITEMS = 500;
 const IMPORT_PROCESS_BATCH_SIZE = 25;
 const IMPORT_ITEM_DEADLINE_MS = 40 * 1000;
@@ -3947,7 +3947,7 @@ async function upsertContentLibraryItem(type, body = {}, actor = {}) {
     if (shouldIngestRemoteGraphic) {
       const remoteUpload = await withStageTimeout(
         fetchRemoteMediaResponse(sourceUrl, UPLOAD_RULES.libraryGraphic, body),
-        15000,
+        30000,
         "remote_media_fetch_stage_timeout",
       );
       const storagePath = `content-library/graphics/${normalizeKey(pendingDocId)}/${Date.now()}.${remoteUpload.extension}`;
