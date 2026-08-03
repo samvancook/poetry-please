@@ -49,9 +49,11 @@ const ADMIN_EMAILS = new Set([
 ]);
 
 const FILE_SIZE_MB = 1024 * 1024;
-const REMOTE_STREAM_TIMEOUT_MS = 90 * 1000;
+const REMOTE_STREAM_TIMEOUT_MS = 20 * 1000;
+const REMOTE_AUTH_TIMEOUT_MS = 4000;
 const IMPORT_JOB_MAX_ITEMS = 500;
 const IMPORT_PROCESS_BATCH_SIZE = 25;
+const IMPORT_ITEM_DEADLINE_MS = 40 * 1000;
 const UPLOAD_RULES = {
   authorPhoto: {
     allowedMimeTypes: new Set(["image/jpeg", "image/png", "image/webp"]),
@@ -97,7 +99,7 @@ const runtimeCloudAuth = new GoogleAuth({
 const directDriveReadAuth = new GoogleAuth({
   scopes: [DRIVE_READ_SCOPE],
 });
-const REMOTE_FETCH_TIMEOUT_MS = 12000;
+const REMOTE_FETCH_TIMEOUT_MS = 4000;
 const CONTENT_CACHE_TTL_MS = 15 * 60 * 1000;
 const CONTENT_SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000;
 const CONTENT_SNAPSHOT_DOC_ID = "content-feed";
@@ -681,7 +683,14 @@ async function getDriveReadAccessToken() {
   } else {
     client = await directDriveReadAuth.getClient();
   }
-  const tokenResponse = await client.getAccessToken();
+  const tokenResponse = await Promise.race([
+    client.getAccessToken(),
+    new Promise((_, reject) => setTimeout(() => {
+      const err = new Error("drive_service_auth_timeout");
+      err.status = 504;
+      reject(err);
+    }, REMOTE_AUTH_TIMEOUT_MS)),
+  ]);
   const token = typeof tokenResponse === "string" ? tokenResponse : tokenResponse?.token;
   if (!token) {
     const err = new Error("drive_service_auth_unavailable");
@@ -3578,6 +3587,18 @@ function importJobItemSummary(item, type, index) {
   };
 }
 
+function withImportItemDeadline(promise, timeoutMs = IMPORT_ITEM_DEADLINE_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error("import_item_timeout");
+      err.status = 504;
+      reject(err);
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function createImportJob({ type, items, actor, batchId = "" }) {
   const normalizedBatchId = sanitizeDocIdSegment(batchId) || `batch-${Date.now()}-${randomBytes(4).toString("hex")}`;
   const jobRef = db.collection(COLLECTIONS.importJobs).doc(normalizedBatchId);
@@ -5988,7 +6009,7 @@ async function processImportJob(batchId, actor, limit = IMPORT_PROCESS_BATCH_SIZ
     const attempts = Number(itemData.attempts || 0) + 1;
     await itemRef.set({ state: "processing", attempts, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
     try {
-      const result = await upsertContentLibraryItem(job.type, item, actor);
+      const result = await withImportItemDeadline(upsertContentLibraryItem(job.type, item, actor));
       await itemRef.set({
         state: "complete",
         result: {

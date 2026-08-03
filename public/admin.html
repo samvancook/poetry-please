@@ -2487,7 +2487,8 @@
         do {
           processPayload = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}/process`, {
             method: 'POST',
-            body: { limit: 25 },
+            body: { limit: 1 },
+            timeoutMs: 120000,
           });
           const counts = processPayload.counts || {};
           statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0}/${items.length} complete, ${counts.failed || 0} failed…`;
