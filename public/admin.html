@@ -880,16 +880,27 @@
       return user ? await user.getIdToken(false) : null;
     }
 
-    async function api(path, { method = "GET", body } = {}) {
+    async function api(path, { method = "GET", body, timeoutMs = 60000 } = {}) {
       const token = await getIdTokenOrNull();
-      const res = await fetch(`/api/${path.replace(/^\//, "")}`, {
-        method,
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: body ? JSON.stringify(body) : undefined,
-      });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      let res;
+      try {
+        res = await fetch(`/api/${path.replace(/^\//, "")}`, {
+          method,
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        if (err?.name === 'AbortError') throw new Error(`API ${method} /api/${path} timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         throw new Error(`API ${method} /api/${path} failed: ${res.status} ${text}`);
@@ -2446,7 +2457,7 @@
         state.importAssistantPreviewRows = payload.rows || [];
         document.getElementById('run-import-assistant-graphics').disabled = !payload.canImport;
         renderImportAssistantResults(state.importAssistantResults);
-        statusEl.textContent = `Validated ${payload.rows.length} rows. ${payload.validCount} valid, ${payload.invalidCount} invalid. ${payload.createCount} create / ${payload.updateCount} update / ${payload.reviewCount || 0} review.${payload.canImport ? '' : ' Import is disabled until at least one row passes validation.'} Drive links can populate filenames during validation.`;
+        statusEl.textContent = `Validated ${payload.rows.length} rows. ${payload.validCount} valid, ${payload.invalidCount} invalid. ${payload.createCount} create / ${payload.updateCount} update / ${payload.reviewCount || 0} review.${payload.canImport ? '' : ' Import is disabled until at least one row passes validation.'} Drive media is fetched during import.`;
       } catch (err) {
         console.error(err);
         statusEl.textContent = err.message || 'Could not validate graphics.';
@@ -2467,11 +2478,22 @@
       statusEl.textContent = 'Importing valid graphics…';
       statusEl.className = 'status';
       try {
-        const payload = await api('admin/contentLibrary/bulkUpsert', {
+        const job = await api('admin/contentLibrary/importJobs', {
           method: 'POST',
           body: { type: 'graphics', items },
         });
-        statusEl.textContent = `Imported ${payload.createdCount} created, ${payload.updatedCount} updated, ${payload.errorCount} failed.`;
+        const batchId = job.batchId;
+        let processPayload = null;
+        do {
+          processPayload = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}/process`, {
+            method: 'POST',
+            body: { limit: 25 },
+          });
+          const counts = processPayload.counts || {};
+          statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0}/${items.length} complete, ${counts.failed || 0} failed…`;
+        } while ((processPayload.counts?.pending || 0) > 0);
+        const counts = processPayload.counts || {};
+        statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0} complete, ${counts.failed || 0} failed. Failed items remain available for retry.`;
         document.getElementById('run-import-assistant-graphics').disabled = true;
       } catch (err) {
         console.error(err);

@@ -39,6 +39,8 @@ const COLLECTIONS = {
   weaverImportLedger: "weaverImportLedger",
   contentSubmissions: "contentSubmissions",
   submissionResponses: "submissionResponses",
+  importJobs: "importJobs",
+  importJobItems: "importJobItems",
   systemState: "systemState",
 };
 
@@ -47,6 +49,9 @@ const ADMIN_EMAILS = new Set([
 ]);
 
 const FILE_SIZE_MB = 1024 * 1024;
+const REMOTE_STREAM_TIMEOUT_MS = 90 * 1000;
+const IMPORT_JOB_MAX_ITEMS = 500;
+const IMPORT_PROCESS_BATCH_SIZE = 25;
 const UPLOAD_RULES = {
   authorPhoto: {
     allowedMimeTypes: new Set(["image/jpeg", "image/png", "image/webp"]),
@@ -92,6 +97,7 @@ const runtimeCloudAuth = new GoogleAuth({
 const directDriveReadAuth = new GoogleAuth({
   scopes: [DRIVE_READ_SCOPE],
 });
+const REMOTE_FETCH_TIMEOUT_MS = 12000;
 const CONTENT_CACHE_TTL_MS = 15 * 60 * 1000;
 const CONTENT_SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000;
 const CONTENT_SNAPSHOT_DOC_ID = "content-feed";
@@ -643,6 +649,23 @@ async function describeRemoteMediaResponse(response, {
   };
 }
 
+async function fetchRemoteWithTimeout(url, options = {}, timeoutMs = REMOTE_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      const timeoutError = new Error("remote_fetch_timeout");
+      timeoutError.status = 504;
+      throw timeoutError;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function getDriveReadAccessToken() {
   const targetPrincipal = normalizeText(process.env.DRIVE_READER_SERVICE_ACCOUNT || "");
   let client;
@@ -673,7 +696,7 @@ async function fetchAuthenticatedGoogleDriveMedia(fileId, sourceUrl, rules, body
   const headers = { Authorization: `Bearer ${token}` };
   const encodedId = encodeURIComponent(fileId);
   const metadataUrl = `https://www.googleapis.com/drive/v3/files/${encodedId}?supportsAllDrives=true&fields=id,name,mimeType,size`;
-  const metadataResponse = await fetch(metadataUrl, { headers });
+  const metadataResponse = await fetchRemoteWithTimeout(metadataUrl, { headers });
   if (!metadataResponse.ok) {
     const err = new Error(`drive_service_fetch_${metadataResponse.status}`);
     err.status = metadataResponse.status === 404 ? 404 : 502;
@@ -681,7 +704,7 @@ async function fetchAuthenticatedGoogleDriveMedia(fileId, sourceUrl, rules, body
   }
   const metadata = await metadataResponse.json();
   const mediaUrl = `https://www.googleapis.com/drive/v3/files/${encodedId}?alt=media&supportsAllDrives=true`;
-  const response = await fetch(mediaUrl, { headers, redirect: "follow" });
+  const response = await fetchRemoteWithTimeout(mediaUrl, { headers, redirect: "follow" });
   if (!response.ok) {
     const err = new Error(`drive_service_fetch_${response.status}`);
     err.status = response.status === 404 ? 404 : 502;
@@ -724,7 +747,7 @@ async function fetchRemoteMediaResponse(sourceUrl, rules, body = {}) {
     : [sourceUrl];
   for (const candidate of candidates) {
     try {
-      const response = await fetch(candidate, { redirect: "follow" });
+      const response = await fetchRemoteWithTimeout(candidate, { redirect: "follow" });
       if (!response.ok) {
         lastError = new Error(`remote_fetch_${response.status}`);
         continue;
@@ -756,6 +779,21 @@ async function streamRemoteMediaToStorage({ sourceUrl, storagePath, rules, body 
   const file = bucket.file(storagePath);
   await new Promise((resolve, reject) => {
     const readStream = Readable.fromWeb(remote.response.body);
+    let settled = false;
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (err) reject(err);
+      else resolve();
+    };
+    const timeout = setTimeout(() => {
+      const err = new Error("remote_stream_timeout");
+      err.status = 504;
+      readStream.destroy(err);
+      writeStream.destroy(err);
+      finish(err);
+    }, REMOTE_STREAM_TIMEOUT_MS);
     let streamedBytes = 0;
     readStream.on("data", (chunk) => {
       streamedBytes += chunk.length;
@@ -770,9 +808,9 @@ async function streamRemoteMediaToStorage({ sourceUrl, storagePath, rules, body 
       },
       resumable: false,
     });
-    readStream.on("error", reject);
-    writeStream.on("error", reject);
-    writeStream.on("finish", resolve);
+    readStream.on("error", finish);
+    writeStream.on("error", finish);
+    writeStream.on("finish", () => finish());
     readStream.pipe(writeStream);
   });
   const publicUrl = await getDownloadURL(file);
@@ -3520,6 +3558,101 @@ async function getAdminContentCount(collection, { imageType = "" } = {}) {
   return Number(aggregate.data().count || 0);
 }
 
+function importJobItemId(type, item, index) {
+  const supplied = normalizeText(item?.idempotencyKey || item?.sourceDriveFileId || "");
+  const identity = supplied || deriveContentDocId(type, item) || `row-${index + 1}`;
+  return createHash("sha256")
+    .update(`${normalizeKey(type)}:${identity}`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+function importJobItemSummary(item, type, index) {
+  return {
+    type,
+    index,
+    requestedId: deriveContentDocId(type, item) || "",
+    idempotencyKey: normalizeText(item?.idempotencyKey || item?.sourceDriveFileId || ""),
+    sourceDriveFileId: normalizeText(item?.sourceDriveFileId || ""),
+    sourceUrl: normalizeText(item?.driveLink || item?.assetLinkUrl || item?.imageUrl || item?.url || ""),
+  };
+}
+
+async function createImportJob({ type, items, actor, batchId = "" }) {
+  const normalizedBatchId = sanitizeDocIdSegment(batchId) || `batch-${Date.now()}-${randomBytes(4).toString("hex")}`;
+  const jobRef = db.collection(COLLECTIONS.importJobs).doc(normalizedBatchId);
+  const existing = await jobRef.get();
+  if (existing.exists) {
+    const existingData = existing.data() || {};
+    if (normalizeKey(existingData.type) !== type || Number(existingData.itemCount || 0) !== items.length) {
+      const err = new Error("import_batch_id_conflict");
+      err.status = 409;
+      throw err;
+    }
+    return { id: normalizedBatchId, existing: true, data: existing.data() || {} };
+  }
+  const itemCollection = db.collection(COLLECTIONS.importJobItems);
+  const batch = db.batch();
+  const seenItemIds = new Set();
+  items.forEach((item, index) => {
+    const itemId = importJobItemId(type, item, index);
+    if (seenItemIds.has(itemId)) {
+      const err = new Error("duplicate_manifest_item");
+      err.status = 409;
+      throw err;
+    }
+    seenItemIds.add(itemId);
+    batch.set(itemCollection.doc(`${normalizedBatchId}_${itemId}`), {
+      batchId: normalizedBatchId,
+      itemId,
+      state: "pending",
+      attempts: 0,
+      ...importJobItemSummary(item, type, index),
+      payload: item,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+  });
+  batch.set(jobRef, {
+    batchId: normalizedBatchId,
+    type,
+    state: "pending",
+    itemCount: items.length,
+    completedCount: 0,
+    failedCount: 0,
+    pendingCount: items.length,
+    createdByUid: actor.uid || "",
+    createdByEmail: actor.email || "",
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  await batch.commit();
+  return { id: normalizedBatchId, existing: false, data: { batchId: normalizedBatchId, type, itemCount: items.length } };
+}
+
+async function updateImportJobCounts(batchId) {
+  const snap = await db.collection(COLLECTIONS.importJobItems).where("batchId", "==", batchId).get();
+  const counts = { pending: 0, processing: 0, complete: 0, failed: 0, duplicate: 0, review: 0 };
+  snap.docs.forEach((doc) => {
+    const state = normalizeKey(doc.data()?.state || "pending");
+    if (Object.prototype.hasOwnProperty.call(counts, state)) counts[state] += 1;
+  });
+  const terminal = counts.complete + counts.duplicate + counts.review;
+  const hasFailures = counts.failed > 0;
+  const state = counts.processing > 0 ? "processing"
+    : counts.pending > 0 ? "pending"
+      : hasFailures ? "failed" : "complete";
+  await db.collection(COLLECTIONS.importJobs).doc(batchId).set({
+    state,
+    pendingCount: counts.pending,
+    processingCount: counts.processing,
+    completedCount: terminal,
+    failedCount: counts.failed,
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+  return { state, ...counts, completedCount: terminal };
+}
+
 function deriveContentDocId(type, body = {}) {
   if (type === "graphics") {
     return normalizeText(body.docId || body.imageId);
@@ -5832,6 +5965,126 @@ app.post(getBoth("/admin/contentLibrary/bulkPreview"), async (req, res) => {
   res.json({ ok: true, createCount, updateCount, errorCount, results });
 });
 
+async function processImportJob(batchId, actor, limit = IMPORT_PROCESS_BATCH_SIZE) {
+  const jobRef = db.collection(COLLECTIONS.importJobs).doc(batchId);
+  const jobSnap = await jobRef.get();
+  if (!jobSnap.exists) {
+    const err = new Error("import_job_not_found");
+    err.status = 404;
+    throw err;
+  }
+  const job = jobSnap.data() || {};
+  const itemSnap = await db.collection(COLLECTIONS.importJobItems)
+    .where("batchId", "==", batchId)
+    .where("state", "==", "pending")
+    .limit(Math.min(Math.max(Number(limit) || IMPORT_PROCESS_BATCH_SIZE, 1), IMPORT_PROCESS_BATCH_SIZE))
+    .get();
+  await jobRef.set({ state: itemSnap.empty ? (job.state || "complete") : "processing", updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+  const processed = [];
+  for (const itemDoc of itemSnap.docs) {
+    const itemRef = itemDoc.ref;
+    const itemData = itemDoc.data() || {};
+    const item = itemData.payload || {};
+    const attempts = Number(itemData.attempts || 0) + 1;
+    await itemRef.set({ state: "processing", attempts, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    try {
+      const result = await upsertContentLibraryItem(job.type, item, actor);
+      await itemRef.set({
+        state: "complete",
+        result: {
+          id: result.item?.id || "",
+          created: !!result.created,
+        },
+        error: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      processed.push({ itemId: itemData.itemId, ok: true, id: result.item?.id || "" });
+    } catch (err) {
+      await itemRef.set({
+        state: "failed",
+        error: err.message || "import_failed",
+        status: Number(err.status || 0) || null,
+        alternateMatches: err.alternateMatches || [],
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      processed.push({ itemId: itemData.itemId, ok: false, error: err.message || "import_failed" });
+    }
+  }
+  const counts = await updateImportJobCounts(batchId);
+  if (processed.some((row) => row.ok)) {
+    invalidateContentCache();
+    await invalidateScoreboardSnapshot(`content_import_job:${batchId}`);
+  }
+  return { batchId, processed, counts };
+}
+
+app.post(getBoth("/admin/contentLibrary/importJobs"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  const type = normalizeKey(req.body?.type);
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+  if (!type || !items.length) return res.status(400).json({ error: "missing_items" });
+  if (items.length > IMPORT_JOB_MAX_ITEMS) return res.status(413).json({ error: "too_many_items", maxItems: IMPORT_JOB_MAX_ITEMS });
+  try {
+    const job = await createImportJob({
+      type,
+      items,
+      batchId: req.body?.batchId,
+      actor: { uid: ctx.decoded.uid, email: ctx.decoded.email },
+    });
+    res.status(job.existing ? 200 : 201).json({ ok: true, batchId: job.id, existing: job.existing, job: job.data });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || "import_job_create_failed" });
+  }
+});
+
+app.post(getBoth("/admin/contentLibrary/importJobs/:batchId/process"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  try {
+    const result = await processImportJob(req.params.batchId, {
+      uid: ctx.decoded.uid,
+      email: ctx.decoded.email,
+    }, req.body?.limit);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || "import_job_process_failed" });
+  }
+});
+
+app.get(getBoth("/admin/contentLibrary/importJobs/:batchId"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  const jobSnap = await db.collection(COLLECTIONS.importJobs).doc(req.params.batchId).get();
+  if (!jobSnap.exists) return res.status(404).json({ error: "import_job_not_found" });
+  const itemSnap = await db.collection(COLLECTIONS.importJobItems).where("batchId", "==", req.params.batchId).get();
+  res.json({
+    ok: true,
+    job: { id: jobSnap.id, ...(jobSnap.data() || {}) },
+    items: itemSnap.docs.map((doc) => ({ id: doc.id, ...(doc.data() || {}), payload: undefined })),
+  });
+});
+
+app.post(getBoth("/admin/contentLibrary/importJobs/:batchId/retryFailed"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  const itemSnap = await db.collection(COLLECTIONS.importJobItems)
+    .where("batchId", "==", req.params.batchId)
+    .where("state", "==", "failed")
+    .get();
+  if (itemSnap.empty) return res.json({ ok: true, retriedCount: 0 });
+  const batch = db.batch();
+  itemSnap.docs.forEach((doc) => batch.set(doc.ref, {
+    state: "pending",
+    error: FieldValue.delete(),
+    status: FieldValue.delete(),
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true }));
+  await batch.commit();
+  const counts = await updateImportJobCounts(req.params.batchId);
+  res.json({ ok: true, retriedCount: itemSnap.size, counts });
+});
+
 app.post(getBoth("/admin/contentLibrary/weaverPreview"), async (req, res) => {
   const ctx = await requireRole(req, res, ["admin"]);
   if (!ctx) return;
@@ -7985,7 +8238,9 @@ app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => 
   const resolved = resolveImportAssistantRows(rows, req.body?.defaults || {}, imageType);
   const results = [];
   const usedDocIds = new Set();
-  const existingGraphics = await getAdminContentDocs(COLLECTIONS.graphics, { searchMode: true });
+  // Preview only needs a bounded collision/match check.  The unbounded search
+  // scan can exceed Cloud Run's request window as the graphics collection grows.
+  const existingGraphics = await getAdminContentDocs(COLLECTIONS.graphics, { searchMode: false });
   for (const row of resolved) {
     let resolvedRow = finalizeImportAssistantGraphicRow(row);
     let item = resolvedRow.contentItem || {};
@@ -7997,21 +8252,13 @@ app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => 
     if (assigned.error) {
       validation = { ok: false, error: assigned.error };
     } else if (item.driveLink) {
-      try {
-        const remote = await fetchRemoteMediaResponse(item.driveLink, UPLOAD_RULES.libraryGraphic, item);
-        resolvedRow = finalizeImportAssistantGraphicRow(resolvedRow, remote);
-        item = resolvedRow.contentItem || item;
-        validation = {
-          ok: true,
-          mimeType: remote.mimeType,
-          fileName: remote.fileName,
-          width: remote.width,
-          height: remote.height,
-          fileSize: remote.fileSize,
-        };
-      } catch (err) {
-        validation = { ok: false, error: err.message || "validation_failed" };
-      }
+      // Preview must be a fast, deterministic metadata/collision check. Media
+      // downloads happen in bulkUpsert, where each item can report its own
+      // fetch/upload error without blocking the whole preview request.
+      validation = {
+        ok: true,
+        remoteValidation: "deferred_to_import",
+      };
     }
     results.push({
       ...resolvedRow,
