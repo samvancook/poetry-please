@@ -680,7 +680,7 @@ function withStageTimeout(promise, timeoutMs, errorCode, status = 504) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-async function getDriveReadAccessToken() {
+async function getDriveReadAuth() {
   const targetPrincipal = normalizeText(process.env.DRIVE_READER_SERVICE_ACCOUNT || "");
   let client;
   if (targetPrincipal) {
@@ -709,11 +709,16 @@ async function getDriveReadAccessToken() {
     err.status = 503;
     throw err;
   }
+  return { client, token };
+}
+
+async function getDriveReadAccessToken() {
+  const { token } = await getDriveReadAuth();
   return token;
 }
 
 async function fetchAuthenticatedGoogleDriveMedia(fileId, sourceUrl, rules, body = {}) {
-  const token = await getDriveReadAccessToken();
+  const { client, token } = await getDriveReadAuth();
   const headers = { Authorization: `Bearer ${token}` };
   const encodedId = encodeURIComponent(fileId);
   const metadataUrl = `https://www.googleapis.com/drive/v3/files/${encodedId}?supportsAllDrives=true&fields=id,name,mimeType,size`;
@@ -729,24 +734,31 @@ async function fetchAuthenticatedGoogleDriveMedia(fileId, sourceUrl, rules, body
     "drive_metadata_parse_timeout",
   );
   const mediaUrl = `https://www.googleapis.com/drive/v3/files/${encodedId}?alt=media&supportsAllDrives=true`;
-  const response = await fetchRemoteWithTimeout(mediaUrl, { headers, redirect: "follow" });
-  if (!response.ok) {
-    const err = new Error(`drive_service_fetch_${response.status}`);
-    err.status = response.status === 404 ? 404 : 502;
+  const mediaResponse = await withStageTimeout(
+    client.request({
+      url: mediaUrl,
+      method: "GET",
+      responseType: "stream",
+      timeout: REMOTE_FETCH_TIMEOUT_MS,
+    }),
+    REMOTE_FETCH_TIMEOUT_MS + 1000,
+    "drive_media_fetch_timeout",
+  );
+  const contentType = normalizeText(metadata.mimeType || mediaResponse.headers?.["content-type"] || "").toLowerCase();
+  if (!rules.allowedMimeTypes.has(contentType)) {
+    const err = new Error("unsupported_remote_media_type");
+    err.status = 415;
     throw err;
   }
-  return withStageTimeout(
-    describeRemoteMediaResponse(response, {
-      candidate: mediaUrl,
-      sourceUrl,
-      rules,
-      body,
-      fileName: normalizeText(metadata.name),
-      contentType: normalizeText(metadata.mimeType),
-    }),
-    REMOTE_FETCH_TIMEOUT_MS,
-    "drive_media_probe_timeout",
-  );
+  return {
+    sourceUrl: mediaUrl,
+    finalUrl: mediaUrl,
+    fileName: normalizeText(metadata.name) || preferredRemoteMediaName(body, sourceUrl),
+    mimeType: contentType,
+    fileSize: Number(metadata.size || mediaResponse.headers?.["content-length"] || 0) || null,
+    nodeStream: mediaResponse.data,
+    extension: extensionForUpload(metadata.name, contentType),
+  };
 }
 
 async function fetchRemoteMediaResponse(sourceUrl, rules, body = {}) {
@@ -805,7 +817,7 @@ async function fetchRemoteMediaResponse(sourceUrl, rules, body = {}) {
 
 async function streamRemoteMediaToStorage({ sourceUrl, storagePath, rules, body = {}, remoteMedia = null }) {
   const remote = remoteMedia || await fetchRemoteMediaResponse(sourceUrl, rules, body);
-  if (!remote.response?.body) {
+  if (!remote.nodeStream && !remote.response?.body) {
     const err = new Error("missing_remote_media_stream");
     err.status = 400;
     throw err;
@@ -813,7 +825,7 @@ async function streamRemoteMediaToStorage({ sourceUrl, storagePath, rules, body 
   const bucket = storage.bucket();
   const file = bucket.file(storagePath);
   await new Promise((resolve, reject) => {
-    const readStream = Readable.fromWeb(remote.response.body);
+    const readStream = remote.nodeStream || Readable.fromWeb(remote.response.body);
     let settled = false;
     const finish = (err) => {
       if (settled) return;
@@ -5987,9 +5999,9 @@ app.get(getBoth("/admin/diagnostics/drive"), async (req, res) => {
   if (!fileId) return res.status(400).json({ error: "missing_file_id" });
 
   const startedAt = Date.now();
-  let token;
+  let driveAuth;
   try {
-    token = await getDriveReadAccessToken();
+    driveAuth = await getDriveReadAuth();
   } catch (err) {
     return res.status(Number(err.status || 502)).json({
       ok: false,
@@ -5999,7 +6011,7 @@ app.get(getBoth("/admin/diagnostics/drive"), async (req, res) => {
     });
   }
 
-  const headers = { Authorization: `Bearer ${token}` };
+  const headers = { Authorization: `Bearer ${driveAuth.token}` };
   let identity = null;
   try {
     const aboutResponse = await fetchRemoteWithTimeout(
@@ -6019,15 +6031,22 @@ app.get(getBoth("/admin/diagnostics/drive"), async (req, res) => {
     if (metadataResponse.ok) {
       const mediaUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`;
       try {
-        const mediaResponse = await fetchRemoteWithTimeout(mediaUrl, { headers, redirect: "follow" });
-        const prefix = mediaResponse.ok
-          ? await withStageTimeout(readResponsePrefix(mediaResponse), REMOTE_FETCH_TIMEOUT_MS, "drive_media_probe_timeout")
-          : Buffer.alloc(0);
+        const mediaResponse = await withStageTimeout(
+          driveAuth.client.request({
+            url: mediaUrl,
+            method: "GET",
+            responseType: "stream",
+            timeout: REMOTE_FETCH_TIMEOUT_MS,
+          }),
+          REMOTE_FETCH_TIMEOUT_MS + 1000,
+          "drive_media_fetch_timeout",
+        );
+        mediaResponse.data?.destroy?.();
         media = {
           status: mediaResponse.status,
-          contentType: mediaResponse.headers.get("content-type") || "",
-          contentLength: mediaResponse.headers.get("content-length") || "",
-          prefixBytes: prefix.length,
+          contentType: mediaResponse.headers?.["content-type"] || "",
+          contentLength: mediaResponse.headers?.["content-length"] || "",
+          stream: "authenticated_client",
         };
       } catch (err) {
         media = { error: err.message || "drive_media_probe_failed", status: Number(err.status || 0) || null };
