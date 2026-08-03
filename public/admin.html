@@ -704,6 +704,15 @@
         <textarea id="import-assistant-text" placeholder="CAMACHO - PE - QUOTE IMAGES - DRIFT - 1.png&#10;WTF - INT - hi-01.jpg"></textarea>
         <div id="import-assistant-status" class="status">No import-assistant run yet.</div>
         <div id="import-assistant-results" class="empty">No results yet.</div>
+        <div class="drawer-section" style="margin-top:18px;">
+          <h3>Drive access diagnostic</h3>
+          <p class="hint">Read-only check of the production service identity and one Drive file. This does not import or modify anything.</p>
+          <div class="controls">
+            <input id="drive-diagnostic-file-id" type="text" placeholder="Drive file ID" />
+            <button id="run-drive-diagnostic" type="button" class="secondary">Check Drive access</button>
+          </div>
+          <div id="drive-diagnostic-status" class="status">No diagnostic run yet.</div>
+        </div>
       </div>
     </section>
 
@@ -2395,6 +2404,26 @@
         filled += 1;
       });
       return filled;
+    }
+
+    async function runDriveDiagnostic() {
+      const fileId = document.getElementById('drive-diagnostic-file-id').value.trim();
+      const statusEl = document.getElementById('drive-diagnostic-status');
+      if (!fileId) {
+        statusEl.textContent = 'Enter a Drive file ID first.';
+        statusEl.className = 'status error';
+        return;
+      }
+      statusEl.textContent = 'Checking production Drive access…';
+      statusEl.className = 'status';
+      try {
+        const result = await api(`admin/diagnostics/drive?fileId=${encodeURIComponent(fileId)}`, { timeoutMs: 30000 });
+        statusEl.textContent = JSON.stringify(result);
+        statusEl.className = result.ok ? 'status success' : 'status error';
+      } catch (err) {
+        statusEl.textContent = err.message || 'Drive diagnostic failed.';
+        statusEl.className = 'status error';
+      }
     }
 
     async function runImportAssistant() {
@@ -4181,6 +4210,7 @@
         if (event.target.id === "author-detail-drawer") closeAuthorDetail();
       });
       document.getElementById("run-import-assistant").addEventListener("click", () => runImportAssistant());
+      document.getElementById("run-drive-diagnostic").addEventListener("click", () => runDriveDiagnostic());
       document.getElementById("preview-import-assistant-graphics").addEventListener("click", () => previewImportAssistantGraphics());
       document.getElementById("run-import-assistant-graphics").addEventListener("click", () => runImportAssistantGraphics());
       document.getElementById("import-assistant-download").addEventListener("click", () => downloadImportAssistantJson());

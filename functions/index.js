@@ -5979,6 +5979,82 @@ app.get(getBoth("/admin/contentLibrary"), async (req, res) => {
   res.json({ items: rows.slice(0, 250), totalCount });
 });
 
+app.get(getBoth("/admin/diagnostics/drive"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  const fileId = extractGoogleDriveFileId(normalizeText(req.query?.fileId || ""))
+    || sanitizeDocIdSegment(req.query?.fileId || "");
+  if (!fileId) return res.status(400).json({ error: "missing_file_id" });
+
+  const startedAt = Date.now();
+  let token;
+  try {
+    token = await getDriveReadAccessToken();
+  } catch (err) {
+    return res.status(Number(err.status || 502)).json({
+      ok: false,
+      stage: "auth",
+      error: err.message || "drive_auth_failed",
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+
+  const headers = { Authorization: `Bearer ${token}` };
+  let identity = null;
+  try {
+    const aboutResponse = await fetchRemoteWithTimeout(
+      "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)",
+      { headers },
+    );
+    identity = aboutResponse.ok ? await aboutResponse.json() : { status: aboutResponse.status };
+  } catch (err) {
+    identity = { error: err.message || "drive_identity_failed" };
+  }
+
+  const metadataUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?supportsAllDrives=true&fields=id,name,mimeType,size,parents,driveId`;
+  try {
+    const metadataResponse = await fetchRemoteWithTimeout(metadataUrl, { headers });
+    const body = metadataResponse.ok ? await metadataResponse.json() : null;
+    let media = null;
+    if (metadataResponse.ok) {
+      const mediaUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`;
+      try {
+        const mediaResponse = await fetchRemoteWithTimeout(mediaUrl, { headers, redirect: "follow" });
+        const prefix = mediaResponse.ok
+          ? await withStageTimeout(readResponsePrefix(mediaResponse), REMOTE_FETCH_TIMEOUT_MS, "drive_media_probe_timeout")
+          : Buffer.alloc(0);
+        media = {
+          status: mediaResponse.status,
+          contentType: mediaResponse.headers.get("content-type") || "",
+          contentLength: mediaResponse.headers.get("content-length") || "",
+          prefixBytes: prefix.length,
+        };
+      } catch (err) {
+        media = { error: err.message || "drive_media_probe_failed", status: Number(err.status || 0) || null };
+      }
+    }
+    return res.status(metadataResponse.ok ? 200 : (metadataResponse.status === 404 ? 404 : 502)).json({
+      ok: metadataResponse.ok,
+      stage: "metadata",
+      identity,
+      fileId,
+      status: metadataResponse.status,
+      file: body,
+      media,
+      elapsedMs: Date.now() - startedAt,
+    });
+  } catch (err) {
+    return res.status(Number(err.status || 502)).json({
+      ok: false,
+      stage: "metadata",
+      identity,
+      fileId,
+      error: err.message || "drive_metadata_failed",
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+});
+
 app.post(getBoth("/admin/contentLibrary/upsert"), async (req, res) => {
   const ctx = await requireRole(req, res, ["admin"]);
   if (!ctx) return;
