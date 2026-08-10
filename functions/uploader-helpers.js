@@ -102,6 +102,10 @@ export function importGraphicMetadataKey(item = {}) {
   return author && book && title ? `${author}|${book}|${title}|${imageType}` : "";
 }
 
+export function shouldCreateSuppliedGraphicVariant({ suppliedDocId = "", sourceMatchCount = 0 } = {}) {
+  return !!normalizeText(suppliedDocId) && Number(sourceMatchCount || 0) === 0;
+}
+
 export function inferRemoteMimeType(contentType = "", fileName = "", sourceUrl = "", rules = null) {
   const rawType = String(contentType || "").split(";")[0].trim().toLowerCase();
   if (rules?.allowedMimeTypes?.has(rawType)) return rawType;

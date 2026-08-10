@@ -23,6 +23,7 @@ import {
   inferRemoteMimeType,
   isCacheGenerationCurrent,
   preserveExistingImportValues,
+  shouldCreateSuppliedGraphicVariant,
 } from "./uploader-helpers.js";
 
 /** ====== CONFIG / CONSTANTS ====== */
@@ -4495,6 +4496,27 @@ async function assignImportAssistantGraphicDocId(row = {}, usedIds = new Set(), 
     const matched = applyImportAssistantGraphicMatch(row, sourceCandidates[0], "source_asset");
     usedIds.add(normalizeKey(matched.row.suggestedDocId));
     return matched;
+  }
+  // A supplied, unused content ID is an authoritative instruction to create a
+  // distinct graphic variant. Metadata alone cannot collapse two different
+  // Drive assets for the same poem back onto one Firestore/Storage identity.
+  if (shouldCreateSuppliedGraphicVariant({
+    suppliedDocId: row.suppliedDocId,
+    sourceMatchCount: sourceCandidates.length,
+  })) {
+    usedIds.add(baseKey);
+    return {
+      row: finalizeImportAssistantGraphicRow({
+        ...row,
+        suggestedDocId: baseId,
+        contentItem: {
+          ...item,
+          docId: baseId,
+          imageId: baseId,
+        },
+      }),
+      action: "create",
+    };
   }
   if (metadataCandidates.length === 1) {
     const matched = applyImportAssistantGraphicMatch(row, metadataCandidates[0], "author_book_title");

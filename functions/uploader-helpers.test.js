@@ -10,6 +10,7 @@ import {
   isCacheGenerationCurrent,
   normalizeStorageObjectName,
   preserveExistingImportValues,
+  shouldCreateSuppliedGraphicVariant,
 } from "./uploader-helpers.js";
 
 const graphicRules = {
@@ -71,6 +72,18 @@ test("duplicate metadata matching normalizes punctuation, spacing, and case", ()
     }),
     incoming
   );
+});
+
+test("an explicit unused graphic ID creates a distinct same-poem variant", () => {
+  assert.equal(shouldCreateSuppliedGraphicVariant({
+    suppliedDocId: "AGTU-QI-IDEATION-V2",
+    sourceMatchCount: 0,
+  }), true);
+  assert.equal(shouldCreateSuppliedGraphicVariant({
+    suppliedDocId: "AGTU-QI-IDEATION-V2",
+    sourceMatchCount: 1,
+  }), false);
+  assert.equal(shouldCreateSuppliedGraphicVariant({ suppliedDocId: "", sourceMatchCount: 0 }), false);
 });
 
 test("storage object normalization preserves the proven Apps Script filename rules", () => {
