@@ -733,6 +733,24 @@ async function getDriveReadAccessToken() {
   return token;
 }
 
+async function fetchAuthenticatedGoogleDriveMetadata(fileId) {
+  const { token } = await getDriveReadAuth();
+  const metadataUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?supportsAllDrives=true&fields=id,name,mimeType,size`;
+  const response = await fetchRemoteWithTimeout(metadataUrl, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    const err = new Error(`drive_service_fetch_${response.status}`);
+    err.status = response.status === 404 ? 404 : 502;
+    throw err;
+  }
+  return withStageTimeout(
+    response.json(),
+    REMOTE_FETCH_TIMEOUT_MS,
+    "drive_metadata_parse_timeout",
+  );
+}
+
 async function fetchAuthenticatedGoogleDriveMedia(fileId, sourceUrl, rules, body = {}) {
   const { client, token } = await getDriveReadAuth();
   const headers = { Authorization: `Bearer ${token}` };
@@ -8660,7 +8678,25 @@ app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => 
   const resolved = resolveImportAssistantRows(rows, req.body?.defaults || {}, imageType);
   const results = [];
   const usedDocIds = new Set();
-  const finalizedRows = resolved.map((row) => finalizeImportAssistantGraphicRow(row));
+  const finalizedRows = await mapWithConcurrency(resolved, 6, async (row) => {
+    let finalized = finalizeImportAssistantGraphicRow(row);
+    if (!finalized.sourceDriveFileId || finalized.predictedMimeType) return finalized;
+    try {
+      const metadata = await fetchAuthenticatedGoogleDriveMetadata(finalized.sourceDriveFileId);
+      finalized = finalizeImportAssistantGraphicRow(row, {
+        fileName: normalizeText(metadata?.name),
+        mimeType: normalizeText(metadata?.mimeType),
+        fileSize: Number(metadata?.size || 0) || null,
+      });
+      return { ...finalized, driveMetadata: metadata };
+    } catch (err) {
+      return {
+        ...finalized,
+        driveMetadataError: err.message || "drive_metadata_failed",
+        driveMetadataStatus: Number(err.status || 0) || null,
+      };
+    }
+  });
   const existingGraphics = await getExistingGraphicsForImportRows(finalizedRows);
   for (const row of finalizedRows) {
     let resolvedRow = row;
@@ -8676,6 +8712,12 @@ app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => 
       validation = { ok: false, error: "graphic_match_review_required" };
     } else if (!resolvedRow.sourceDriveFileId) {
       validation = { ok: false, error: "invalid_drive_file_link" };
+    } else if (resolvedRow.driveMetadataError) {
+      validation = {
+        ok: false,
+        error: resolvedRow.driveMetadataError,
+        status: resolvedRow.driveMetadataStatus,
+      };
     } else if (!resolvedRow.predictedMimeType) {
       validation = { ok: false, error: "unsupported_file_extension_for_preview" };
     } else if (item.driveLink) {
