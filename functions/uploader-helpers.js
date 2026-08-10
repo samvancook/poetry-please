@@ -122,6 +122,20 @@ export function shouldForceGraphicAssetReplacement({
   return normalizedBrokenIds.has(normalizedDocId);
 }
 
+export function nextAvailableGraphicVariantId({ baseId = "", unavailableIds = [] } = {}) {
+  const cleanBaseId = normalizeText(baseId);
+  if (!cleanBaseId) return "";
+  const unavailable = new Set(
+    Array.from(unavailableIds || []).map((value) => normalizeText(value).toLowerCase()).filter(Boolean)
+  );
+  if (!unavailable.has(cleanBaseId.toLowerCase())) return cleanBaseId;
+  for (let variant = 2; variant < 10000; variant += 1) {
+    const candidate = `${cleanBaseId}-V${variant}`;
+    if (!unavailable.has(candidate.toLowerCase())) return candidate;
+  }
+  throw new Error("graphic_variant_limit_exceeded");
+}
+
 export function inferRemoteMimeType(contentType = "", fileName = "", sourceUrl = "", rules = null) {
   const rawType = String(contentType || "").split(";")[0].trim().toLowerCase();
   if (rules?.allowedMimeTypes?.has(rawType)) return rawType;

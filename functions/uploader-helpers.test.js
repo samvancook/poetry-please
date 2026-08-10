@@ -9,6 +9,7 @@ import {
   inferRemoteMimeType,
   isCacheGenerationCurrent,
   normalizeStorageObjectName,
+  nextAvailableGraphicVariantId,
   preserveExistingImportValues,
   shouldCreateSuppliedGraphicVariant,
   shouldForceGraphicAssetReplacement,
@@ -102,6 +103,20 @@ test("known-broken QI IDs force a fresh asset upload", () => {
     requestedForce: true,
     brokenIds,
   }), true);
+});
+
+test("graphic variants use the first available deterministic suffix", () => {
+  assert.equal(nextAvailableGraphicVariantId({
+    baseId: "TCAW-QI-THE-CROWN-AIN-T-WORTH-MUCH",
+    unavailableIds: new Set(),
+  }), "TCAW-QI-THE-CROWN-AIN-T-WORTH-MUCH");
+  assert.equal(nextAvailableGraphicVariantId({
+    baseId: "TCAW-QI-THE-CROWN-AIN-T-WORTH-MUCH",
+    unavailableIds: new Set([
+      "tcaw-qi-the-crown-ain-t-worth-much",
+      "TCAW-QI-THE-CROWN-AIN-T-WORTH-MUCH-V2",
+    ]),
+  }), "TCAW-QI-THE-CROWN-AIN-T-WORTH-MUCH-V3");
 });
 
 test("storage object normalization preserves the proven Apps Script filename rules", () => {

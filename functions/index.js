@@ -22,6 +22,7 @@ import {
   importGraphicMetadataKey,
   inferRemoteMimeType,
   isCacheGenerationCurrent,
+  nextAvailableGraphicVariantId,
   preserveExistingImportValues,
   shouldCreateSuppliedGraphicVariant,
   shouldForceGraphicAssetReplacement,
@@ -4381,6 +4382,8 @@ async function previewContentLibraryItem(type, body = {}) {
 }
 
 function importAssistantGraphicSourceKey(item = {}) {
+  const directDriveId = normalizeText(item.sourceDriveFileId || "");
+  if (directDriveId) return `drive:${directDriveId}`;
   const candidates = [
     item.driveLink,
     item.assetLinkUrl,
@@ -4436,7 +4439,7 @@ async function assignImportAssistantGraphicDocId(row = {}, usedIds = new Set(), 
   if (!baseId) return { row, action: "error" };
 
   const baseKey = normalizeKey(baseId);
-  if (usedIds.has(baseKey)) {
+  if (usedIds.has(baseKey) && normalizeText(row.suppliedDocId)) {
     return { row, action: "error", error: "duplicate_id_in_batch" };
   }
 
@@ -4462,12 +4465,27 @@ async function assignImportAssistantGraphicDocId(row = {}, usedIds = new Set(), 
   };
   const sourceCandidates = uniqueById(sourceMatches);
   const metadataCandidates = uniqueById(metadataMatches);
+  const incomingSourceKey = importAssistantGraphicSourceKey(item);
+  const existingIds = new Set(existingGraphics.map((existing) => (
+    normalizeKey(existing.contentId || existing.imageId || existing.id || "")
+  )).filter(Boolean));
+
+  if (sourceCandidates.length === 1) {
+    const matched = applyImportAssistantGraphicMatch(row, sourceCandidates[0], "source_asset");
+    const matchedKey = normalizeKey(matched.row.suggestedDocId);
+    if (usedIds.has(matchedKey)) {
+      return { row, action: "error", error: "duplicate_source_in_batch" };
+    }
+    usedIds.add(matchedKey);
+    return matched;
+  }
 
   if (exactMatches.length === 1) {
     const exactMatch = exactMatches[0];
     const exactMatchConfirmed = !!normalizeText(row.suppliedDocId)
       || importAssistantGraphicSourcesMatch(exactMatch, item)
       || (
+        !incomingSourceKey &&
         !!metadataKey &&
         importAssistantGraphicMetadataKey(exactMatch) === metadataKey
       );
@@ -4475,28 +4493,27 @@ async function assignImportAssistantGraphicDocId(row = {}, usedIds = new Set(), 
       usedIds.add(baseKey);
       return applyImportAssistantGraphicMatch(row, exactMatch, "exact_id");
     }
-    return {
-      row: {
-        ...row,
-        alternateMatches: [{
-          id: exactMatch.contentId || exactMatch.imageId || exactMatch.id || "",
-          author: exactMatch.author || "",
-          book: exactMatch.book || "",
-          title: exactMatch.title || exactMatch.poem || "",
-          matchReason: "id_collision",
-        }],
-      },
-      action: "review",
-      error: "id_collision_review_required",
-    };
+    const exactMetadataMatches = !!metadataKey
+      && importAssistantGraphicMetadataKey(exactMatch) === metadataKey;
+    if (!exactMetadataMatches) {
+      return {
+        row: {
+          ...row,
+          alternateMatches: [{
+            id: exactMatch.contentId || exactMatch.imageId || exactMatch.id || "",
+            author: exactMatch.author || "",
+            book: exactMatch.book || "",
+            title: exactMatch.title || exactMatch.poem || "",
+            matchReason: "id_collision",
+          }],
+        },
+        action: "review",
+        error: "id_collision_review_required",
+      };
+    }
   }
   if (exactMatches.length > 1) {
     return { row, action: "review", error: "ambiguous_exact_id" };
-  }
-  if (sourceCandidates.length === 1) {
-    const matched = applyImportAssistantGraphicMatch(row, sourceCandidates[0], "source_asset");
-    usedIds.add(normalizeKey(matched.row.suggestedDocId));
-    return matched;
   }
   // A supplied, unused content ID is an authoritative instruction to create a
   // distinct graphic variant. Metadata alone cannot collapse two different
@@ -4519,13 +4536,16 @@ async function assignImportAssistantGraphicDocId(row = {}, usedIds = new Set(), 
       action: "create",
     };
   }
-  if (metadataCandidates.length === 1) {
-    const matched = applyImportAssistantGraphicMatch(row, metadataCandidates[0], "author_book_title");
+  const metadataFallbackCandidates = incomingSourceKey
+    ? metadataCandidates.filter((existing) => !importAssistantGraphicSourceKey(existing))
+    : metadataCandidates;
+  if (metadataFallbackCandidates.length === 1) {
+    const matched = applyImportAssistantGraphicMatch(row, metadataFallbackCandidates[0], "author_book_title");
     usedIds.add(normalizeKey(matched.row.suggestedDocId));
     return matched;
   }
 
-  const ambiguousCandidates = uniqueById([...sourceCandidates, ...metadataCandidates]);
+  const ambiguousCandidates = uniqueById([...sourceCandidates, ...metadataFallbackCandidates]);
   if (ambiguousCandidates.length > 1) {
     return {
       row: {
@@ -4542,15 +4562,20 @@ async function assignImportAssistantGraphicDocId(row = {}, usedIds = new Set(), 
       error: "ambiguous_existing_matches",
     };
   }
-  usedIds.add(baseKey);
+  const variantId = nextAvailableGraphicVariantId({
+    baseId,
+    unavailableIds: new Set([...usedIds, ...existingIds]),
+  });
+  const variantKey = normalizeKey(variantId);
+  usedIds.add(variantKey);
   return {
     row: finalizeImportAssistantGraphicRow({
       ...row,
-      suggestedDocId: baseId,
+      suggestedDocId: variantId,
       contentItem: {
         ...item,
-        docId: baseId,
-        imageId: baseId,
+        docId: variantId,
+        imageId: variantId,
       },
     }),
     action: "create",
