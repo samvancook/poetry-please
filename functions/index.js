@@ -21,6 +21,7 @@ import {
   detectRemoteMediaMimeType,
   importGraphicMetadataKey,
   inferRemoteMimeType,
+  isCacheGenerationCurrent,
   preserveExistingImportValues,
 } from "./uploader-helpers.js";
 
@@ -120,6 +121,7 @@ const CANONICAL_POEM_COUNT_TTL_MS = 6 * 60 * 60 * 1000;
 const canonicalPoemCountCache = new Map();
 let contentCache = {
   builtAt: 0,
+  sourceBuiltAtMs: 0,
   payload: null,
   inFlight: null,
 };
@@ -418,6 +420,7 @@ async function getAllContent() {
 
 function invalidateContentCache({ strict = false } = {}) {
   contentCache.builtAt = 0;
+  contentCache.sourceBuiltAtMs = 0;
   contentCache.payload = null;
   contentCache.inFlight = null;
   contentSnapshotInvalidatedAt = Date.now();
@@ -428,6 +431,27 @@ function invalidateContentCache({ strict = false } = {}) {
     console.warn("Content snapshot invalidation failed", err);
     if (strict) throw err;
   });
+}
+
+async function isMemoryContentCacheCurrent() {
+  if (!contentCache.payload || !contentCache.sourceBuiltAtMs) return false;
+  try {
+    const metaSnap = await db.collection(COLLECTIONS.systemState).doc(CONTENT_SNAPSHOT_DOC_ID).get();
+    if (!metaSnap.exists) return false;
+    const meta = metaSnap.data() || {};
+    const snapshotBuiltAtMs = timestampToMs(meta.builtAt);
+    const invalidatedAtMs = timestampToMs(meta.invalidatedAt);
+    return isCacheGenerationCurrent({
+      sourceBuiltAtMs: contentCache.sourceBuiltAtMs,
+      snapshotBuiltAtMs,
+      invalidatedAtMs,
+    });
+  } catch (err) {
+    // Keep the application available during a transient metadata read failure;
+    // the normal memory TTL still bounds this fallback.
+    console.warn("Content cache generation check failed; using bounded memory cache", err);
+    return true;
+  }
 }
 
 async function readContentSnapshot() {
@@ -467,7 +491,10 @@ async function writeContentSnapshot(payload) {
 async function getAllContentCached({ forceRefresh = false } = {}) {
   const now = Date.now();
   if (!forceRefresh && contentCache.payload && (now - contentCache.builtAt) < CONTENT_CACHE_TTL_MS) {
-    return contentCache.payload;
+    if (await isMemoryContentCacheCurrent()) return contentCache.payload;
+    contentCache.builtAt = 0;
+    contentCache.sourceBuiltAtMs = 0;
+    contentCache.payload = null;
   }
   if (!forceRefresh && contentCache.inFlight) {
     return contentCache.inFlight;
@@ -482,6 +509,7 @@ async function getAllContentCached({ forceRefresh = false } = {}) {
           // Memory freshness starts when the snapshot is loaded, not when the
           // durable snapshot was originally built.
           contentCache.builtAt = Date.now();
+          contentCache.sourceBuiltAtMs = snapshot.builtAtMs;
           console.info("Content cache loaded", { source: "snapshot", count: snapshot.payload.length, durationMs: Date.now() - startedAt });
           return contentCache.payload;
         }
@@ -493,9 +521,10 @@ async function getAllContentCached({ forceRefresh = false } = {}) {
     const payload = (await getAllContent()).map(canonicalizeContentRecord);
     contentCache.payload = payload;
     contentCache.builtAt = Date.now();
+    contentCache.sourceBuiltAtMs = 0;
     console.info("Content cache loaded", { source: "firestore", count: payload.length, durationMs: Date.now() - startedAt });
     try {
-      await writeContentSnapshot(payload);
+      contentCache.sourceBuiltAtMs = await writeContentSnapshot(payload);
     } catch (err) {
       console.warn("Content snapshot write failed", err);
     }

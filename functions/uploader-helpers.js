@@ -79,6 +79,12 @@ export function preserveExistingImportValues(existing = {}, incoming = {}, clear
   }, {});
 }
 
+export function isCacheGenerationCurrent({ sourceBuiltAtMs = 0, snapshotBuiltAtMs = 0, invalidatedAtMs = 0 } = {}) {
+  if (!sourceBuiltAtMs || !snapshotBuiltAtMs) return false;
+  if (invalidatedAtMs && invalidatedAtMs >= sourceBuiltAtMs) return false;
+  return snapshotBuiltAtMs <= sourceBuiltAtMs;
+}
+
 export function normalizeImportMatchValue(value) {
   return normalizeText(value)
     .normalize("NFKC")

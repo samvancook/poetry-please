@@ -7,6 +7,7 @@ import {
   detectRemoteMediaMimeType,
   importGraphicMetadataKey,
   inferRemoteMimeType,
+  isCacheGenerationCurrent,
   normalizeStorageObjectName,
   preserveExistingImportValues,
 } from "./uploader-helpers.js";
@@ -126,4 +127,10 @@ test("import updates only clear existing values when explicitly requested", () =
     preserveExistingImportValues({ releaseCatalog: "2026 Spring Catalog" }, { releaseCatalog: "" }, ["releaseCatalog"]),
     { releaseCatalog: "" }
   );
+});
+
+test("cross-instance cache generations reject invalidated or newer snapshots", () => {
+  assert.equal(isCacheGenerationCurrent({ sourceBuiltAtMs: 200, snapshotBuiltAtMs: 200, invalidatedAtMs: 100 }), true);
+  assert.equal(isCacheGenerationCurrent({ sourceBuiltAtMs: 200, snapshotBuiltAtMs: 0, invalidatedAtMs: 250 }), false);
+  assert.equal(isCacheGenerationCurrent({ sourceBuiltAtMs: 200, snapshotBuiltAtMs: 300, invalidatedAtMs: 100 }), false);
 });
