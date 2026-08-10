@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  canonicalImportManifestJson,
   contentIdSlug,
+  deterministicGraphicStoragePath,
   detectRemoteMediaMimeType,
   importGraphicMetadataKey,
   inferRemoteMimeType,
+  normalizeStorageObjectName,
+  preserveExistingImportValues,
 } from "./uploader-helpers.js";
 
 const graphicRules = {
@@ -65,5 +69,61 @@ test("duplicate metadata matching normalizes punctuation, spacing, and case", ()
       imageType: "qi",
     }),
     incoming
+  );
+});
+
+test("storage object normalization preserves the proven Apps Script filename rules", () => {
+  assert.equal(
+    normalizeStorageObjectName("SCHMINKEY - DBAT - QUOTE IMAGE – A good cry canary", "image/png"),
+    "SCHMINKEY-DBAT-QUOTE-IMAGE-A-good-cry-canary.png"
+  );
+  assert.equal(normalizeStorageObjectName("already-safe.JPG", "image/jpeg"), "already-safe.JPG");
+});
+
+test("graphic storage paths are stable across retries", () => {
+  const input = {
+    docId: "DBAT-QI-A-GOOD-CRY-CANARY",
+    fileName: "SCHMINKEY - DBAT - QUOTE IMAGE - A good cry canary.png",
+    mimeType: "image/png",
+  };
+  assert.equal(
+    deterministicGraphicStoragePath(input),
+    "content-library/graphics/dbat-qi-a-good-cry-canary/SCHMINKEY-DBAT-QUOTE-IMAGE-A-good-cry-canary.png"
+  );
+  assert.equal(deterministicGraphicStoragePath(input), deterministicGraphicStoragePath(input));
+});
+
+test("manifest canonicalization ignores object key order but preserves item order", () => {
+  const first = canonicalImportManifestJson("graphics", [{ imageId: "A", driveLink: "drive-1" }]);
+  const reordered = canonicalImportManifestJson("graphics", [{ driveLink: "drive-1", imageId: "A" }]);
+  const differentOrder = canonicalImportManifestJson("graphics", [
+    { imageId: "B", driveLink: "drive-2" },
+    { imageId: "A", driveLink: "drive-1" },
+  ]);
+  assert.equal(first, reordered);
+  assert.notEqual(first, differentOrder);
+});
+
+test("import updates preserve enriched values when incoming cells are blank", () => {
+  const merged = preserveExistingImportValues({
+    releaseCatalog: "2026 Spring Catalog",
+    book: "A Good Cry",
+    misc: "old note",
+  }, {
+    releaseCatalog: "",
+    book: "A Good Cry",
+    misc: "",
+    title: "Canary",
+  });
+  assert.deepEqual(merged, {
+    book: "A Good Cry",
+    title: "Canary",
+  });
+});
+
+test("import updates only clear existing values when explicitly requested", () => {
+  assert.deepEqual(
+    preserveExistingImportValues({ releaseCatalog: "2026 Spring Catalog" }, { releaseCatalog: "" }, ["releaseCatalog"]),
+    { releaseCatalog: "" }
   );
 });

@@ -697,10 +697,11 @@
           <button id="run-import-assistant" type="button">Resolve metadata</button>
           <button id="preview-import-assistant-graphics" type="button" class="secondary">Validate graphics</button>
           <button id="run-import-assistant-graphics" type="button" class="secondary" disabled>Import valid graphics</button>
+          <button id="retry-import-assistant-failed" type="button" class="secondary" disabled>Retry failed rows</button>
           <button id="import-assistant-download" type="button" class="secondary">Download JSON</button>
           <button id="import-assistant-load-first" type="button" class="secondary">Load first into form</button>
         </div>
-        <div class="hint">Use one filename per line, or tab-separated columns in this order: file name, author, book, title, drive link, optional content ID. For graphics, validation checks the media and existing Poetry Please records before import.</div>
+        <div class="hint">Use one filename per line, or tab-separated columns in this order: file name, author, book, title, Drive link, optional content ID. Validation shows the exact content ID, Drive file ID, and deterministic Storage path before import. Media bytes are fetched only after you confirm.</div>
         <textarea id="import-assistant-text" placeholder="CAMACHO - PE - QUOTE IMAGES - DRIFT - 1.png&#10;WTF - INT - hi-01.jpg"></textarea>
         <div id="import-assistant-status" class="status">No import-assistant run yet.</div>
         <div id="import-assistant-results" class="empty">No results yet.</div>
@@ -947,6 +948,7 @@
       submissionTypeFilter: "all",
       importAssistantResults: [],
       importAssistantPreviewRows: [],
+      importAssistantBatchId: "",
       contentItems: [],
       contentTotalCount: 0,
       contentType: "all",
@@ -2260,13 +2262,21 @@
       return {
         collection,
         contentId: row.suggestedDocId || '',
+        docId: row.suggestedDocId || '',
+        imageId: row.suggestedDocId || '',
         imageType,
         author: row.author || '',
         book: row.book || '',
         title: imageType === 'EXC' ? '' : (row.title || ''),
         poem: imageType === 'EXC' ? (row.title || '') : '',
         imageUrl: '',
+        fileName: row.fileName || '',
         driveLink: row.driveLink || '',
+        sourceDriveFileId: row.sourceDriveFileId || '',
+        sourceSystem: row.contentItem?.sourceSystem || 'poetry_please_admin',
+        sourceRecordId: row.contentItem?.sourceRecordId || row.sourceDriveFileId || row.suggestedDocId || '',
+        idempotencyKey: row.idempotencyKey || '',
+        predictedStoragePath: row.predictedStoragePath || '',
         bookLink: row.bookLink || '',
         releaseCatalog: row.releaseCatalog || '',
         bookShortener: row.bookShortener || '',
@@ -2340,6 +2350,7 @@
               <th>Doc ID</th>
               <th>Write</th>
               <th>Validation</th>
+              <th>Result</th>
               <th>Action</th>
             </tr>
           </thead>
@@ -2369,8 +2380,14 @@
                   ${(row.alternateMatches || []).length ? `<div class="meta" style="color:#9a3f2d;">Review: ${(row.alternateMatches || []).map((match) => escapeHtml(match.id || '')).join(', ')}</div>` : ''}
                 </td>
                 <td>${row.validation ? (row.validation.ok
-                  ? `${escapeHtml(row.validation.fileName || row.fileName || 'image')} · ${escapeHtml(row.validation.mimeType || 'image')} · ${escapeHtml(String(row.validation.width || '?'))}×${escapeHtml(String(row.validation.height || '?'))}`
+                  ? `<div>Drive file ${escapeHtml(row.validation.sourceDriveFileId || row.sourceDriveFileId || 'verified at import')}</div><div class="meta">${escapeHtml(row.validation.predictedStoragePath || row.predictedStoragePath || '')}</div>`
                   : `<span class="meta" style="color:#9a3f2d;">${escapeHtml(row.validation.error || 'invalid')}</span>`) : '—'}</td>
+                <td>${row.jobResult ? `
+                  <div>${escapeHtml(row.jobResult.state || '—')}${row.jobResult.result?.action ? ` · ${escapeHtml(row.jobResult.result.action)}` : ''}</div>
+                  ${row.jobResult.result?.assetReused ? '<div class="meta">Storage object reused</div>' : ''}
+                  ${row.jobResult.result?.storagePath ? `<div class="meta">${escapeHtml(row.jobResult.result.storagePath)}</div>` : ''}
+                  ${row.jobResult.error ? `<div class="meta" style="color:#9a3f2d;">${escapeHtml(row.jobResult.error)}</div>` : ''}
+                ` : '—'}</td>
                 <td><button type="button" class="secondary" data-import-assistant-use="${escapeHtml(row.index)}">Use in form</button></td>
               </tr>
             `).join('')}
@@ -2437,6 +2454,9 @@
       }
       statusEl.textContent = 'Resolving metadata…';
       statusEl.className = 'status';
+      state.importAssistantBatchId = '';
+      document.getElementById('retry-import-assistant-failed').disabled = true;
+      document.getElementById('retry-import-assistant-failed').textContent = 'Retry failed rows';
       document.getElementById('run-import-assistant-graphics').disabled = true;
       try {
         const payload = await api('admin/importAssistant/resolve', {
@@ -2473,6 +2493,9 @@
       }
       statusEl.textContent = 'Validating graphics…';
       statusEl.className = 'status';
+      state.importAssistantBatchId = '';
+      document.getElementById('retry-import-assistant-failed').disabled = true;
+      document.getElementById('retry-import-assistant-failed').textContent = 'Retry failed rows';
       try {
         const payload = await api('admin/importAssistant/previewGraphics', {
           method: 'POST',
@@ -2494,61 +2517,99 @@
       }
     }
 
+    function applyImportJobResults(snapshot) {
+      const resultsById = new Map((snapshot.items || []).map((item) => [String(item.requestedId || ''), item]));
+      state.importAssistantResults = state.importAssistantResults.map((row) => ({
+        ...row,
+        jobResult: resultsById.get(String(row.suggestedDocId || '')) || row.jobResult || null,
+      }));
+      state.importAssistantPreviewRows = state.importAssistantResults;
+      renderImportAssistantResults(state.importAssistantResults);
+    }
+
+    async function processImportAssistantJob(batchId, itemCount, statusEl) {
+      let processPayload = null;
+      do {
+        processPayload = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}/process`, {
+          method: 'POST',
+          body: { limit: 2 },
+          timeoutMs: 120000,
+        });
+        const counts = processPayload.counts || {};
+        statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0}/${itemCount} complete, ${counts.failed || 0} failed…`;
+      } while ((processPayload.counts?.pending || 0) > 0);
+
+      const snapshot = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}`);
+      applyImportJobResults(snapshot);
+      const counts = processPayload?.counts || {};
+      const failed = (snapshot.items || []).filter((item) => item.state === 'failed');
+      const publishError = processPayload?.publishError || snapshot.job?.publishError || '';
+      const retryButton = document.getElementById('retry-import-assistant-failed');
+      retryButton.disabled = failed.length === 0 && !publishError;
+      retryButton.textContent = publishError && !failed.length ? 'Retry publication' : 'Retry failed rows';
+      if (publishError) {
+        statusEl.textContent = `Batch ${batchId}: records completed, but Poetry Please cache publication failed — ${publishError}. Run processing again to retry publication; completed rows will not be uploaded again.`;
+        statusEl.className = 'status error';
+      } else if (failed.length) {
+        statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0} complete, ${failed.length} failed — ${failed.map((item) => `${item.requestedId || item.itemId}: ${item.error || 'import_failed'}${item.status ? ` (${item.status})` : ''}`).join(' | ')}`;
+        statusEl.className = 'status error';
+      } else {
+        statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || itemCount} complete, 0 failed.`;
+        statusEl.className = 'status success';
+      }
+      return snapshot;
+    }
+
     async function runImportAssistantGraphics() {
       const statusEl = document.getElementById('import-assistant-status');
       const rows = state.importAssistantPreviewRows.length ? state.importAssistantPreviewRows : state.importAssistantResults;
-      const items = rows.filter((row) => row.validation?.ok).map((row) => row.contentItem).filter(Boolean);
+      const items = rows.filter((row) => row.validation?.ok && ['create', 'update'].includes(row.action)).map((row) => row.contentItem).filter(Boolean);
       if (!items.length) {
-        statusEl.textContent = 'Validate graphics first, then import the valid rows.';
+        statusEl.textContent = 'Validate graphics first, then import the valid create/update rows.';
         statusEl.className = 'status error';
         document.getElementById('run-import-assistant-graphics').disabled = true;
         return;
       }
-      statusEl.textContent = 'Importing valid graphics…';
+      statusEl.textContent = 'Creating deterministic import job…';
       statusEl.className = 'status';
-      let batchId = '';
       try {
         const job = await api('admin/contentLibrary/importJobs', {
           method: 'POST',
           body: { type: 'graphics', items },
         });
-        batchId = job.batchId;
-        let processPayload = null;
-        do {
-          processPayload = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}/process`, {
-            method: 'POST',
-            body: { limit: 1 },
-            timeoutMs: 120000,
-          });
-          const counts = processPayload.counts || {};
-          statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0}/${items.length} complete, ${counts.failed || 0} failed…`;
-        } while ((processPayload.counts?.pending || 0) > 0);
-        const counts = processPayload.counts || {};
-        if (counts.failed) {
-          const snapshot = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}`);
-          const failed = (snapshot.items || []).filter((item) => item.state === 'failed');
-          statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0} complete, ${counts.failed} failed — ${failed.map((item) => `${item.requestedId || item.itemId}: ${item.error || 'import_failed'}${item.status ? ` (${item.status})` : ''}`).join(' | ')}`;
-          statusEl.className = 'status error';
-        } else {
-          statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0} complete, 0 failed.`;
-        }
+        state.importAssistantBatchId = job.batchId;
+        await processImportAssistantJob(job.batchId, items.length, statusEl);
         document.getElementById('run-import-assistant-graphics').disabled = true;
       } catch (err) {
         console.error(err);
-        if (batchId) {
-          try {
-            const snapshot = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}`);
-            const failed = (snapshot.items || []).filter((item) => item.state === 'failed');
-            if (failed.length) {
-              statusEl.textContent = `Batch ${batchId}: ${failed.length} failed — ${failed.map((item) => `${item.requestedId || item.itemId}: ${item.error || 'import_failed'}${item.status ? ` (${item.status})` : ''}`).join(' | ')}`;
-              statusEl.className = 'status error';
-              return;
-            }
-          } catch (statusErr) {
-            console.error(statusErr);
-          }
-        }
         statusEl.textContent = err.message || 'Could not import valid graphics.';
+        statusEl.className = 'status error';
+      }
+    }
+
+    async function retryImportAssistantFailed() {
+      const statusEl = document.getElementById('import-assistant-status');
+      const batchId = state.importAssistantBatchId;
+      if (!batchId) {
+        statusEl.textContent = 'No import batch is available to retry.';
+        statusEl.className = 'status error';
+        return;
+      }
+      try {
+        const retry = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}/retryFailed`, { method: 'POST' });
+        if (!retry.retriedCount && !retry.publicationRetry) {
+          statusEl.textContent = `Batch ${batchId} has no failed rows to retry.`;
+          document.getElementById('retry-import-assistant-failed').disabled = true;
+          return;
+        }
+        statusEl.textContent = retry.publicationRetry
+          ? 'Retrying Poetry Please cache publication…'
+          : `Retrying ${retry.retriedCount} failed row${retry.retriedCount === 1 ? '' : 's'}…`;
+        statusEl.className = 'status';
+        await processImportAssistantJob(batchId, state.importAssistantResults.filter((row) => row.validation?.ok).length, statusEl);
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = err.message || 'Could not retry failed rows.';
         statusEl.className = 'status error';
       }
     }
@@ -4213,6 +4274,7 @@
       document.getElementById("run-drive-diagnostic").addEventListener("click", () => runDriveDiagnostic());
       document.getElementById("preview-import-assistant-graphics").addEventListener("click", () => previewImportAssistantGraphics());
       document.getElementById("run-import-assistant-graphics").addEventListener("click", () => runImportAssistantGraphics());
+      document.getElementById("retry-import-assistant-failed").addEventListener("click", () => retryImportAssistantFailed());
       document.getElementById("import-assistant-download").addEventListener("click", () => downloadImportAssistantJson());
       document.getElementById("import-assistant-load-first").addEventListener("click", () => loadFirstImportAssistantRowIntoForm());
       document.getElementById("users-toggle").addEventListener("click", () => {

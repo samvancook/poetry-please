@@ -8,6 +8,23 @@ function extensionForRemoteMedia(fileName = "", sourceUrl = "") {
   return (match?.[1] || "").toLowerCase();
 }
 
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort()
+      .reduce((result, key) => {
+        if (value[key] !== undefined) result[key] = stableValue(value[key]);
+        return result;
+      }, {});
+  }
+  return typeof value === "string" ? value.trim() : value;
+}
+
+export function stableJsonStringify(value) {
+  return JSON.stringify(stableValue(value));
+}
+
 export function contentIdSlug(value) {
   return normalizeText(value)
     .normalize("NFKC")
@@ -15,6 +32,51 @@ export function contentIdSlug(value) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 500);
+}
+
+export function normalizeStorageObjectName(value, contentType = "") {
+  let name = normalizeText(value).split("/").pop() || "";
+  name = name
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/[^A-Za-z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!name) throw new Error("empty_storage_object_name");
+  if (!/\.[A-Za-z0-9]{2,5}$/.test(name)) {
+    const subtype = normalizeText(contentType).split("/")[1]?.toLowerCase() || "";
+    const extension = subtype === "jpeg" ? "jpg" : subtype.replace(/[^a-z0-9]/g, "");
+    name += `.${extension || "bin"}`;
+  }
+  return name;
+}
+
+export function deterministicGraphicStoragePath({ docId = "", fileName = "", mimeType = "" } = {}) {
+  const docSegment = contentIdSlug(docId);
+  if (!docSegment) throw new Error("missing_content_id");
+  const objectName = normalizeStorageObjectName(fileName || docId, mimeType);
+  return `content-library/graphics/${docSegment}/${objectName}`;
+}
+
+export function canonicalImportManifestJson(type, items = []) {
+  const normalizedType = normalizeText(type).toLowerCase();
+  const payload = {
+    type: normalizedType,
+    items: (Array.isArray(items) ? items : []).map((item) => stableValue(item || {})),
+  };
+  return stableJsonStringify(payload);
+}
+
+export function preserveExistingImportValues(existing = {}, incoming = {}, clearFields = []) {
+  const allowedClears = new Set((Array.isArray(clearFields) ? clearFields : []).map(normalizeText).filter(Boolean));
+  return Object.entries(incoming || {}).reduce((result, [key, value]) => {
+    const incomingIsBlank = value === "" || value === null || value === undefined;
+    const existingValue = existing?.[key];
+    const existingHasValue = existingValue !== "" && existingValue !== null && existingValue !== undefined;
+    if (incomingIsBlank && existingHasValue && !allowedClears.has(key)) return result;
+    result[key] = value;
+    return result;
+  }, {});
 }
 
 export function normalizeImportMatchValue(value) {

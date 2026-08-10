@@ -14,11 +14,14 @@ import { getAuth } from "firebase-admin/auth";
 import { getStorage, getDownloadURL } from "firebase-admin/storage";
 import { GoogleAuth, Impersonated } from "google-auth-library";
 import {
+  canonicalImportManifestJson,
   contentIdSlug,
+  deterministicGraphicStoragePath,
   detectImageMimeType,
   detectRemoteMediaMimeType,
   importGraphicMetadataKey,
   inferRemoteMimeType,
+  preserveExistingImportValues,
 } from "./uploader-helpers.js";
 
 /** ====== CONFIG / CONSTANTS ====== */
@@ -53,7 +56,7 @@ const REMOTE_STREAM_TIMEOUT_MS = 20 * 1000;
 const REMOTE_AUTH_TIMEOUT_MS = 15000;
 const IMPORT_JOB_MAX_ITEMS = 500;
 const IMPORT_PROCESS_BATCH_SIZE = 25;
-const IMPORT_ITEM_DEADLINE_MS = 40 * 1000;
+const IMPORT_STALE_PROCESSING_MS = 10 * 60 * 1000;
 const UPLOAD_RULES = {
   authorPhoto: {
     allowedMimeTypes: new Set(["image/jpeg", "image/png", "image/webp"]),
@@ -413,16 +416,17 @@ async function getAllContent() {
   return [...g, ...e, ...fp, ...v];
 }
 
-function invalidateContentCache() {
+function invalidateContentCache({ strict = false } = {}) {
   contentCache.builtAt = 0;
   contentCache.payload = null;
   contentCache.inFlight = null;
   contentSnapshotInvalidatedAt = Date.now();
-  db.collection(COLLECTIONS.systemState).doc(CONTENT_SNAPSHOT_DOC_ID).set({
+  return db.collection(COLLECTIONS.systemState).doc(CONTENT_SNAPSHOT_DOC_ID).set({
     invalidatedAt: FieldValue.serverTimestamp(),
     builtAt: null,
   }, { merge: true }).catch((err) => {
     console.warn("Content snapshot invalidation failed", err);
+    if (strict) throw err;
   });
 }
 
@@ -568,6 +572,18 @@ function extractGoogleDriveFileId(url = "") {
 
 function isGoogleDriveFileUrl(url = "") {
   return !!extractGoogleDriveFileId(url);
+}
+
+function isStorageBucketRootUrl(url = "") {
+  const raw = normalizeText(url);
+  if (!raw) return false;
+  try {
+    const parsed = new URL(raw);
+    if (!/(^|\.)storage\.googleapis\.com$/i.test(parsed.hostname)) return false;
+    return String(parsed.pathname || "").split("/").filter(Boolean).length <= 1;
+  } catch (_err) {
+    return false;
+  }
 }
 
 function isGoogleDriveFolderUrl(url = "") {
@@ -815,7 +831,14 @@ async function fetchRemoteMediaResponse(sourceUrl, rules, body = {}) {
   throw err;
 }
 
-async function streamRemoteMediaToStorage({ sourceUrl, storagePath, rules, body = {}, remoteMedia = null }) {
+async function streamRemoteMediaToStorage({
+  sourceUrl,
+  storagePath,
+  rules,
+  body = {},
+  remoteMedia = null,
+  customMetadata = {},
+}) {
   const remote = remoteMedia || await fetchRemoteMediaResponse(sourceUrl, rules, body);
   if (!remote.nodeStream && !remote.response?.body) {
     const err = new Error("missing_remote_media_stream");
@@ -852,6 +875,7 @@ async function streamRemoteMediaToStorage({ sourceUrl, storagePath, rules, body 
       metadata: {
         contentType: remote.mimeType,
         cacheControl: "public,max-age=3600",
+        metadata: customMetadata,
       },
       resumable: false,
     });
@@ -986,6 +1010,12 @@ function mapContentDuplicateDoc(doc) {
     releaseCatalog: data.releaseCatalog || "",
     currentImageUrl: data.currentImageUrl || "",
     driveLink: data.driveLink || "",
+    sourceDriveFileId: data.sourceDriveFileId || "",
+    sourceFileName: data.sourceFileName || "",
+    sourceSystem: data.sourceSystem || "",
+    sourceRecordId: data.sourceRecordId || "",
+    idempotencyKey: data.idempotencyKey || "",
+    storagePath: data.storagePath || "",
     duplicateOfImageId: data.duplicateOfImageId || "",
     duplicateOfTitle: data.duplicateOfTitle || "",
     duplicateOfAuthor: data.duplicateOfAuthor || "",
@@ -3570,6 +3600,12 @@ function mapAdminContentDoc(collection, doc) {
     bookShortener: data.bookShortener || "",
     updatedFileName: data.updatedFileName || "",
     misc: data.misc || "",
+    sourceDriveFileId: data.sourceDriveFileId || "",
+    sourceFileName: data.sourceFileName || "",
+    sourceSystem: data.sourceSystem || "",
+    sourceRecordId: data.sourceRecordId || "",
+    idempotencyKey: data.idempotencyKey || "",
+    storagePath: data.storagePath || "",
     createdAt: data.createdAt || null,
     updatedAt: data.updatedAt || null,
     updatedBy: data.updatedBy || "",
@@ -3610,12 +3646,32 @@ async function getAdminContentCount(collection, { imageType = "" } = {}) {
 }
 
 function importJobItemId(type, item, index) {
-  const supplied = normalizeText(item?.idempotencyKey || item?.sourceDriveFileId || "");
+  const supplied = normalizeText(item?.idempotencyKey || "");
   const identity = supplied || deriveContentDocId(type, item) || `row-${index + 1}`;
   return createHash("sha256")
     .update(`${normalizeKey(type)}:${identity}`)
     .digest("hex")
     .slice(0, 32);
+}
+
+function canonicalizeImportItem(type, item = {}) {
+  const requestedId = deriveContentDocId(type, item) || "";
+  const sourceDriveFileId = normalizeText(item.sourceDriveFileId)
+    || extractGoogleDriveFileId(item.driveLink || item.assetLinkUrl || item.sourceUrl || item.imageUrl || item.url || "");
+  const defaultIdempotencyKey = [normalizeKey(type), sourceDriveFileId || "no-drive-source", requestedId || "no-content-id"].join(":");
+  return {
+    ...item,
+    sourceDriveFileId,
+    sourceSystem: normalizeText(item.sourceSystem || "poetry_please_import"),
+    sourceRecordId: normalizeText(item.sourceRecordId || sourceDriveFileId || requestedId),
+    idempotencyKey: normalizeText(item.idempotencyKey || defaultIdempotencyKey),
+  };
+}
+
+function importManifestHash(type, items) {
+  return createHash("sha256")
+    .update(canonicalImportManifestJson(type, items))
+    .digest("hex");
 }
 
 function importJobItemSummary(item, type, index) {
@@ -3629,25 +3685,19 @@ function importJobItemSummary(item, type, index) {
   };
 }
 
-function withImportItemDeadline(promise, timeoutMs = IMPORT_ITEM_DEADLINE_MS) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      const err = new Error("import_item_timeout");
-      err.status = 504;
-      reject(err);
-    }, timeoutMs);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
 async function createImportJob({ type, items, actor, batchId = "" }) {
-  const normalizedBatchId = sanitizeDocIdSegment(batchId) || `batch-${Date.now()}-${randomBytes(4).toString("hex")}`;
+  const canonicalItems = items.map((item) => canonicalizeImportItem(type, item));
+  const manifestHash = importManifestHash(type, canonicalItems);
+  const normalizedBatchId = sanitizeDocIdSegment(batchId) || `batch-${manifestHash.slice(0, 24)}`;
   const jobRef = db.collection(COLLECTIONS.importJobs).doc(normalizedBatchId);
   const existing = await jobRef.get();
   if (existing.exists) {
     const existingData = existing.data() || {};
-    if (normalizeKey(existingData.type) !== type || Number(existingData.itemCount || 0) !== items.length) {
+    if (
+      normalizeKey(existingData.type) !== type
+      || Number(existingData.itemCount || 0) !== canonicalItems.length
+      || normalizeText(existingData.manifestHash) !== manifestHash
+    ) {
       const err = new Error("import_batch_id_conflict");
       err.status = 409;
       throw err;
@@ -3657,7 +3707,7 @@ async function createImportJob({ type, items, actor, batchId = "" }) {
   const itemCollection = db.collection(COLLECTIONS.importJobItems);
   const batch = db.batch();
   const seenItemIds = new Set();
-  items.forEach((item, index) => {
+  canonicalItems.forEach((item, index) => {
     const itemId = importJobItemId(type, item, index);
     if (seenItemIds.has(itemId)) {
       const err = new Error("duplicate_manifest_item");
@@ -3679,18 +3729,24 @@ async function createImportJob({ type, items, actor, batchId = "" }) {
   batch.set(jobRef, {
     batchId: normalizedBatchId,
     type,
+    manifestVersion: 1,
+    manifestHash,
     state: "pending",
-    itemCount: items.length,
+    itemCount: canonicalItems.length,
     completedCount: 0,
     failedCount: 0,
-    pendingCount: items.length,
+    pendingCount: canonicalItems.length,
     createdByUid: actor.uid || "",
     createdByEmail: actor.email || "",
     createdAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),
   });
   await batch.commit();
-  return { id: normalizedBatchId, existing: false, data: { batchId: normalizedBatchId, type, itemCount: items.length } };
+  return {
+    id: normalizedBatchId,
+    existing: false,
+    data: { batchId: normalizedBatchId, type, itemCount: canonicalItems.length, manifestHash },
+  };
 }
 
 async function updateImportJobCounts(batchId) {
@@ -3714,6 +3770,29 @@ async function updateImportJobCounts(batchId) {
     updatedAt: FieldValue.serverTimestamp(),
   }, { merge: true });
   return { state, ...counts, completedCount: terminal };
+}
+
+async function recoverStaleImportJobItems(batchId) {
+  const snap = await db.collection(COLLECTIONS.importJobItems)
+    .where("batchId", "==", batchId)
+    .where("state", "==", "processing")
+    .get();
+  if (snap.empty) return 0;
+  const cutoff = Date.now() - IMPORT_STALE_PROCESSING_MS;
+  const stale = snap.docs.filter((doc) => {
+    const updatedAt = doc.data()?.updatedAt;
+    const updatedMs = typeof updatedAt?.toMillis === "function" ? updatedAt.toMillis() : 0;
+    return !updatedMs || updatedMs < cutoff;
+  });
+  if (!stale.length) return 0;
+  const batch = db.batch();
+  stale.forEach((doc) => batch.set(doc.ref, {
+    state: "pending",
+    recoveryReason: "stale_processing_lease_recovered",
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true }));
+  await batch.commit();
+  return stale.length;
 }
 
 function deriveContentDocId(type, body = {}) {
@@ -3779,6 +3858,9 @@ function buildContentDocPayload(type, body = {}, options = {}) {
   const sourceRecordId = normalizeText(body.sourceRecordId);
   if (sourceSystem) payload.sourceSystem = sourceSystem;
   if (sourceRecordId) payload.sourceRecordId = sourceRecordId;
+  if (normalizeText(body.sourceDriveFileId)) payload.sourceDriveFileId = normalizeText(body.sourceDriveFileId);
+  if (normalizeText(body.idempotencyKey)) payload.idempotencyKey = normalizeText(body.idempotencyKey);
+  if (normalizeText(body.fileName || body.sourceFileName)) payload.sourceFileName = normalizeText(body.fileName || body.sourceFileName);
   if (normalizeText(body.excerptHash)) payload.excerptHash = normalizeText(body.excerptHash);
   if (normalizeText(body.normalizedExcerpt)) payload.normalizedExcerpt = normalizeText(body.normalizedExcerpt);
   if (normalizeText(body.sourceUrl)) payload.sourceUrl = normalizeText(body.sourceUrl);
@@ -3889,6 +3971,144 @@ async function resolveContentRefForDelete(collection, requestedId, type) {
   return null;
 }
 
+function deterministicContentAssetId(contentDocId, storagePath) {
+  return createHash("sha256")
+    .update(`graphics:${contentDocId}:${storagePath}`)
+    .digest("hex")
+    .slice(0, 40);
+}
+
+async function storeImportGraphicAsset({ pendingDocId, sourceUrl, body, actor }) {
+  const remoteUpload = await withStageTimeout(
+    fetchRemoteMediaResponse(sourceUrl, UPLOAD_RULES.libraryGraphic, body),
+    30000,
+    "remote_media_fetch_stage_timeout",
+  );
+  const sourceDriveFileId = normalizeText(body.sourceDriveFileId)
+    || extractGoogleDriveFileId(sourceUrl);
+  const storagePath = deterministicGraphicStoragePath({
+    docId: pendingDocId,
+    fileName: normalizeText(body.storageObjectName || body.updatedFileName || pendingDocId),
+    mimeType: remoteUpload.mimeType,
+  });
+  const file = storage.bucket().file(storagePath);
+  const [exists] = await withStageTimeout(file.exists(), 10000, "storage_lookup_timeout");
+  let stored;
+  let reused = false;
+  if (exists && !body.forceAssetReplace) {
+    const [metadata] = await withStageTimeout(file.getMetadata(), 10000, "storage_metadata_timeout");
+    const storedSourceDriveFileId = normalizeText(metadata?.metadata?.sourceDriveFileId || "");
+    const storedContentDocId = normalizeText(metadata?.metadata?.contentDocId || "");
+    if (!storedSourceDriveFileId || !storedContentDocId) {
+      const err = new Error("storage_identity_unverifiable");
+      err.status = 409;
+      throw err;
+    }
+    if (
+      (storedSourceDriveFileId && sourceDriveFileId && storedSourceDriveFileId !== sourceDriveFileId)
+      || (storedContentDocId && storedContentDocId !== pendingDocId)
+    ) {
+      const err = new Error("storage_identity_conflict");
+      err.status = 409;
+      throw err;
+    }
+    stored = {
+      publicUrl: await withStageTimeout(getDownloadURL(file), 10000, "storage_url_timeout"),
+      storagePath,
+      fileSize: Number(metadata?.size || remoteUpload.fileSize || 0) || null,
+      mimeType: normalizeText(metadata?.contentType || remoteUpload.mimeType),
+      fileName: remoteUpload.fileName,
+      finalUrl: remoteUpload.finalUrl,
+    };
+    remoteUpload.nodeStream?.destroy?.();
+    remoteUpload.response?.body?.cancel?.().catch?.(() => {});
+    reused = true;
+  } else {
+    stored = await withStageTimeout(
+      streamRemoteMediaToStorage({
+        sourceUrl,
+        storagePath,
+        rules: UPLOAD_RULES.libraryGraphic,
+        body,
+        remoteMedia: remoteUpload,
+        customMetadata: {
+          contentDocId: pendingDocId,
+          sourceDriveFileId,
+          idempotencyKey: normalizeText(body.idempotencyKey),
+          sourceSystem: normalizeText(body.sourceSystem || "poetry_please_import"),
+        },
+      }),
+      25000,
+      "remote_media_stream_stage_timeout",
+    );
+  }
+
+  const assetId = deterministicContentAssetId(pendingDocId, storagePath);
+  const assetRef = db.collection(COLLECTIONS.contentAssets).doc(assetId);
+  const assetSnap = await assetRef.get();
+  await assetRef.set({
+    assetType: "library_graphic",
+    imageId: pendingDocId,
+    contentCollection: COLLECTIONS.graphics,
+    contentDocId: pendingDocId,
+    storagePath,
+    publicUrl: stored.publicUrl,
+    fileSize: stored.fileSize,
+    mimeType: stored.mimeType,
+    originalFileName: stored.fileName,
+    sourceUrl,
+    sourceFinalUrl: stored.finalUrl,
+    sourceDriveFileId,
+    idempotencyKey: normalizeText(body.idempotencyKey),
+    sourceSystem: normalizeText(body.sourceSystem || "poetry_please_import"),
+    uploadedByUid: actor.uid || "",
+    uploadedByEmail: actor.email || "",
+    status: "active",
+    reused,
+    updatedAt: FieldValue.serverTimestamp(),
+    createdAt: assetSnap.exists && assetSnap.data()?.createdAt
+      ? assetSnap.data().createdAt
+      : FieldValue.serverTimestamp(),
+  }, { merge: true });
+  return { ...stored, reused, assetId, sourceDriveFileId };
+}
+
+async function getExistingGraphicsForImportRows(rows = []) {
+  const byId = new Map();
+  const remember = (item) => {
+    const key = normalizeKey(item?.contentId || item?.imageId || item?.id || "");
+    if (key) byId.set(key, item);
+  };
+
+  // A small recent sample supports legacy metadata matching without making
+  // preview download every graphic document and its large ancillary fields.
+  const recent = await getAdminContentDocs(COLLECTIONS.graphics, { searchMode: false });
+  recent.forEach(remember);
+
+  // Exact document IDs are authoritative. Fetch every proposed ID directly so
+  // no existing record can be misreported as a create merely because it fell
+  // outside the recent sample.
+  const exactRefs = rows
+    .map((row) => sanitizeDocIdSegment(row?.contentItem?.docId || row?.suggestedDocId || ""))
+    .filter(Boolean)
+    .map((id) => db.collection(COLLECTIONS.graphics).doc(id));
+  for (let start = 0; start < exactRefs.length; start += 100) {
+    const snapshots = await db.getAll(...exactRefs.slice(start, start + 100));
+    snapshots.filter((snap) => snap.exists).forEach((snap) => remember(mapAdminContentDoc(COLLECTIONS.graphics, snap)));
+  }
+
+  // Provenance-aware source matching catches a Drive file that was previously
+  // imported under a different content ID without scanning the full library.
+  const sourceIds = uniq(rows.map((row) => normalizeText(row?.sourceDriveFileId)).filter(Boolean));
+  for (let start = 0; start < sourceIds.length; start += 30) {
+    const snap = await db.collection(COLLECTIONS.graphics)
+      .where("sourceDriveFileId", "in", sourceIds.slice(start, start + 30))
+      .get();
+    snap.docs.forEach((doc) => remember(mapAdminContentDoc(COLLECTIONS.graphics, doc)));
+  }
+  return [...byId.values()];
+}
+
 async function upsertContentLibraryItem(type, body = {}, actor = {}) {
   const collection = collectionForContentType(type);
   if (!collection) {
@@ -3919,6 +4139,7 @@ async function upsertContentLibraryItem(type, body = {}, actor = {}) {
   const existing = sourceSnap.exists ? (sourceSnap.data() || {}) : {};
 
   let uploadImageUrl = "";
+  let uploadAsset = null;
   if (normalizeKey(type) === "graphics" && normalizeText(body?.base64Data)) {
     const upload = parseBase64Upload(body, UPLOAD_RULES.replacementImage);
     const storagePath = `content-library/graphics/${normalizeKey(pendingDocId)}/${Date.now()}.${upload.extension}`;
@@ -3928,6 +4149,7 @@ async function upsertContentLibraryItem(type, body = {}, actor = {}) {
       buffer: upload.buffer,
     });
     uploadImageUrl = publicUrl;
+    uploadAsset = { storagePath, publicUrl, reused: false };
 
     const assetRef = db.collection(COLLECTIONS.contentAssets).doc();
     await assetRef.set({
@@ -3955,45 +4177,15 @@ async function upsertContentLibraryItem(type, body = {}, actor = {}) {
       && !isGoogleDriveFileUrl(body.imageUrl);
     const shouldIngestRemoteGraphic = !!sourceUrl
       && !preserveProvidedImageUrl
-      && (!currentImageUrl || isGoogleDriveFileUrl(currentImageUrl));
+      && (
+        !!body.forceAssetReplace
+        || !currentImageUrl
+        || isGoogleDriveFileUrl(currentImageUrl)
+        || isStorageBucketRootUrl(currentImageUrl)
+      );
     if (shouldIngestRemoteGraphic) {
-      const remoteUpload = await withStageTimeout(
-        fetchRemoteMediaResponse(sourceUrl, UPLOAD_RULES.libraryGraphic, body),
-        30000,
-        "remote_media_fetch_stage_timeout",
-      );
-      const storagePath = `content-library/graphics/${normalizeKey(pendingDocId)}/${Date.now()}.${remoteUpload.extension}`;
-      const streamedUpload = await withStageTimeout(
-        streamRemoteMediaToStorage({
-          sourceUrl,
-          storagePath,
-          rules: UPLOAD_RULES.libraryGraphic,
-          body,
-          remoteMedia: remoteUpload,
-        }),
-        25000,
-        "remote_media_stream_stage_timeout",
-      );
-      uploadImageUrl = streamedUpload.publicUrl;
-
-      const assetRef = db.collection(COLLECTIONS.contentAssets).doc();
-      await assetRef.set({
-        assetType: "library_graphic",
-        imageId: pendingDocId,
-        contentCollection: collection,
-        contentDocId: pendingDocId,
-        storagePath: streamedUpload.storagePath,
-        publicUrl: streamedUpload.publicUrl,
-        fileSize: streamedUpload.fileSize,
-        mimeType: streamedUpload.mimeType,
-        originalFileName: streamedUpload.fileName,
-        sourceUrl,
-        sourceFinalUrl: streamedUpload.finalUrl,
-        uploadedByUid: actor.uid || "",
-        uploadedByEmail: actor.email || "",
-        status: "active",
-        createdAt: FieldValue.serverTimestamp(),
-      });
+      uploadAsset = await storeImportGraphicAsset({ pendingDocId, sourceUrl, body, actor });
+      uploadImageUrl = uploadAsset.publicUrl;
     }
   }
 
@@ -4037,10 +4229,13 @@ async function upsertContentLibraryItem(type, body = {}, actor = {}) {
   }
 
   const existingImageUrl = normalizeText(existing.imageUrl || "");
+  const requestedImageUrl = normalizeText(body.imageUrl || "");
   const shouldPreserveHostedGraphicUrl = normalizeKey(type) === "graphics"
     && !uploadImageUrl
     && !!existingImageUrl
-    && !isGoogleDriveFileUrl(existingImageUrl);
+    && !isGoogleDriveFileUrl(existingImageUrl)
+    && !isStorageBucketRootUrl(existingImageUrl)
+    && (!requestedImageUrl || requestedImageUrl === existingImageUrl);
   const imageUrlForPayload = shouldPreserveHostedGraphicUrl
     ? existingImageUrl
     : normalizeText(uploadImageUrl || body.imageUrl);
@@ -4050,6 +4245,10 @@ async function upsertContentLibraryItem(type, body = {}, actor = {}) {
     mediaUrl: uploadMediaUrl,
     updatedBy: actor.uid || "",
   });
+  if (sourceSnap.exists && normalizeText(body.idempotencyKey)) {
+    built.payload = preserveExistingImportValues(existing, built.payload, body.clearFields);
+  }
+  if (uploadAsset?.storagePath) built.payload.storagePath = uploadAsset.storagePath;
   if (normalizeKey(type) === "excerpts" && built.payload.excerptFingerprint) {
     const allowedExistingIds = new Set([pendingDocId, originalDocId].filter(Boolean));
     let duplicateSnap = await db.collection(COLLECTIONS.excerpts)
@@ -4106,6 +4305,7 @@ async function upsertContentLibraryItem(type, body = {}, actor = {}) {
     item: mapAdminContentDoc(collection, saved),
     created: !sourceSnap.exists,
     renamed: isRename && originalSnap?.exists,
+    asset: uploadAsset,
   };
 }
 
@@ -6083,7 +6283,7 @@ app.post(getBoth("/admin/contentLibrary/upsert"), async (req, res) => {
       uid: ctx.decoded.uid,
       email: ctx.decoded.email,
     });
-    invalidateContentCache();
+    await invalidateContentCache();
     await invalidateScoreboardSnapshot(`content_upsert:${normalizeKey(result?.item?.id || "")}`);
     res.json(result);
   } catch (err) {
@@ -6128,6 +6328,7 @@ async function processImportJob(batchId, actor, limit = IMPORT_PROCESS_BATCH_SIZ
     throw err;
   }
   const job = jobSnap.data() || {};
+  const recoveredCount = await recoverStaleImportJobItems(batchId);
   const itemSnap = await db.collection(COLLECTIONS.importJobItems)
     .where("batchId", "==", batchId)
     .where("state", "==", "pending")
@@ -6140,16 +6341,32 @@ async function processImportJob(batchId, actor, limit = IMPORT_PROCESS_BATCH_SIZ
     const itemData = itemDoc.data() || {};
     const item = itemData.payload || {};
     const attempts = Number(itemData.attempts || 0) + 1;
-    await itemRef.set({ state: "processing", attempts, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    await itemRef.set({
+      state: "processing",
+      attempts,
+      processingStartedAt: FieldValue.serverTimestamp(),
+      leaseExpiresAt: new Date(Date.now() + IMPORT_STALE_PROCESSING_MS),
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
     try {
-      const result = await withImportItemDeadline(upsertContentLibraryItem(job.type, item, actor));
+      // Upload, Storage, and Firestore stages enforce their own aborting
+      // deadlines. Do not wrap the whole operation in Promise.race: that can
+      // mark an item failed while its underlying write continues.
+      const result = await upsertContentLibraryItem(job.type, item, actor);
       await itemRef.set({
         state: "complete",
         result: {
           id: result.item?.id || "",
           created: !!result.created,
+          action: result.created ? "created" : "updated",
+          imageUrl: result.item?.imageUrl || "",
+          storagePath: result.asset?.storagePath || "",
+          assetReused: !!result.asset?.reused,
+          sourceDriveFileId: normalizeText(item.sourceDriveFileId),
         },
         error: FieldValue.delete(),
+        status: FieldValue.delete(),
+        leaseExpiresAt: FieldValue.delete(),
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
       processed.push({ itemId: itemData.itemId, ok: true, id: result.item?.id || "" });
@@ -6157,19 +6374,38 @@ async function processImportJob(batchId, actor, limit = IMPORT_PROCESS_BATCH_SIZ
       await itemRef.set({
         state: "failed",
         error: err.message || "import_failed",
+        errorCode: err.message || "import_failed",
         status: Number(err.status || 0) || null,
         alternateMatches: err.alternateMatches || [],
+        leaseExpiresAt: FieldValue.delete(),
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
       processed.push({ itemId: itemData.itemId, ok: false, error: err.message || "import_failed" });
     }
   }
   const counts = await updateImportJobCounts(batchId);
-  if (processed.some((row) => row.ok)) {
-    invalidateContentCache();
-    await invalidateScoreboardSnapshot(`content_import_job:${batchId}`);
+  let publishError = "";
+  if (counts.pending === 0 && counts.processing === 0 && counts.completedCount > 0) {
+    try {
+      await invalidateContentCache({ strict: true });
+      await invalidateScoreboardSnapshot(`content_import_job:${batchId}`);
+      await jobRef.set({
+        state: counts.state,
+        publishError: FieldValue.delete(),
+        publishedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } catch (err) {
+      publishError = err.message || "content_publish_invalidation_failed";
+      await jobRef.set({
+        state: "publish_failed",
+        publishError,
+        publishFailedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    }
   }
-  return { batchId, processed, counts };
+  return { batchId, recoveredCount, processed, counts, publishError };
 }
 
 app.post(getBoth("/admin/contentLibrary/importJobs"), async (req, res) => {
@@ -6226,12 +6462,21 @@ app.post(getBoth("/admin/contentLibrary/importJobs/:batchId/retryFailed"), async
     .where("batchId", "==", req.params.batchId)
     .where("state", "==", "failed")
     .get();
-  if (itemSnap.empty) return res.json({ ok: true, retriedCount: 0 });
+  if (itemSnap.empty) {
+    const jobSnap = await db.collection(COLLECTIONS.importJobs).doc(req.params.batchId).get();
+    return res.json({
+      ok: true,
+      retriedCount: 0,
+      publicationRetry: !!normalizeText(jobSnap.data()?.publishError),
+    });
+  }
   const batch = db.batch();
   itemSnap.docs.forEach((doc) => batch.set(doc.ref, {
     state: "pending",
     error: FieldValue.delete(),
+    errorCode: FieldValue.delete(),
     status: FieldValue.delete(),
+    leaseExpiresAt: FieldValue.delete(),
     updatedAt: FieldValue.serverTimestamp(),
   }, { merge: true }));
   await batch.commit();
@@ -6351,7 +6596,7 @@ app.post(getBoth("/admin/contentLibrary/bulkUpsert"), async (req, res) => {
   const updatedCount = results.filter((row) => row.ok && !row.created).length;
   const errorCount = results.filter((row) => !row.ok).length;
   if (createdCount || updatedCount) {
-    invalidateContentCache();
+    await invalidateContentCache();
     await invalidateScoreboardSnapshot(`content_bulk_upsert:${type}`);
   }
   res.json({ ok: true, createdCount, updatedCount, errorCount, results });
@@ -8277,7 +8522,7 @@ app.post(getBoth("/admin/contentSubmissions/:submissionId/review"), async (req, 
 });
 
 function resolveImportAssistantRows(rows = [], defaults = {}, imageType = "QI") {
-  return rows.slice(0, 100).map((row, index) => {
+  return rows.slice(0, IMPORT_JOB_MAX_ITEMS).map((row, index) => {
     const fileName = normalizeText(row?.fileName || row?.sourceFileName || "");
     const author = canonicalizeAuthorName(row?.author || defaults?.author || "");
     const book = normalizeText(row?.book || defaults?.book || "");
@@ -8349,6 +8594,18 @@ function finalizeImportAssistantGraphicRow(row, remoteMedia = null) {
   const effectiveDocId = explicitDocId || (row?.bookShortener && effectiveTitle
     ? `${row.bookShortener}-${row.imageType}-${contentIdSlug(effectiveTitle)}`.toUpperCase()
     : "");
+  const sourceDriveFileId = normalizeText(row?.sourceDriveFileId)
+    || extractGoogleDriveFileId(row?.driveLink || "");
+  const predictedMimeType = normalizeText(remoteMedia?.mimeType)
+    || inferRemoteMimeType("", effectiveFileName, row?.driveLink || "", UPLOAD_RULES.libraryGraphic);
+  const storagePath = effectiveDocId
+    ? deterministicGraphicStoragePath({
+      docId: effectiveDocId,
+      fileName: normalizeText(row?.storageObjectName || row?.updatedFileName || effectiveDocId),
+      mimeType: predictedMimeType,
+    })
+    : "";
+  const idempotencyKey = ["graphics", sourceDriveFileId || "no-drive-source", effectiveDocId || "no-content-id"].join(":");
   const miscParts = [
     effectiveFileName ? `Import Assistant source file: ${effectiveFileName}` : "",
     row?.folderLink ? `Import Assistant folder: ${row.folderLink}` : "",
@@ -8360,12 +8617,23 @@ function finalizeImportAssistantGraphicRow(row, remoteMedia = null) {
     fileName: effectiveFileName,
     title: effectiveTitle,
     suggestedDocId: effectiveDocId,
+    sourceDriveFileId,
+    predictedMimeType,
+    predictedStoragePath: storagePath,
+    idempotencyKey,
     contentItem: {
       ...(row?.contentItem || {}),
       docId: effectiveDocId,
       imageId: effectiveDocId,
       title: effectiveTitle,
+      fileName: effectiveFileName,
       driveLink: normalizeText(row?.driveLink || ""),
+      sourceDriveFileId,
+      mimeType: predictedMimeType,
+      sourceSystem: normalizeText(row?.sourceSystem || "poetry_please_admin"),
+      sourceRecordId: normalizeText(row?.sourceRecordId || sourceDriveFileId || effectiveDocId),
+      idempotencyKey,
+      predictedStoragePath: storagePath,
       pageNumber: normalizeText(row?.pageNumber || ""),
       bookShortener: normalizeText(row?.bookShortener || ""),
       misc: miscParts.join(" · "),
@@ -8392,11 +8660,10 @@ app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => 
   const resolved = resolveImportAssistantRows(rows, req.body?.defaults || {}, imageType);
   const results = [];
   const usedDocIds = new Set();
-  // Preview only needs a bounded collision/match check.  The unbounded search
-  // scan can exceed Cloud Run's request window as the graphics collection grows.
-  const existingGraphics = await getAdminContentDocs(COLLECTIONS.graphics, { searchMode: false });
-  for (const row of resolved) {
-    let resolvedRow = finalizeImportAssistantGraphicRow(row);
+  const finalizedRows = resolved.map((row) => finalizeImportAssistantGraphicRow(row));
+  const existingGraphics = await getExistingGraphicsForImportRows(finalizedRows);
+  for (const row of finalizedRows) {
+    let resolvedRow = row;
     let item = resolvedRow.contentItem || {};
     const assigned = await assignImportAssistantGraphicDocId(resolvedRow, usedDocIds, existingGraphics);
     resolvedRow = assigned.row;
@@ -8405,6 +8672,12 @@ app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => 
     let validation = { ok: false, error: "missing_drive_link" };
     if (assigned.error) {
       validation = { ok: false, error: assigned.error };
+    } else if (!["create", "update"].includes(action)) {
+      validation = { ok: false, error: "graphic_match_review_required" };
+    } else if (!resolvedRow.sourceDriveFileId) {
+      validation = { ok: false, error: "invalid_drive_file_link" };
+    } else if (!resolvedRow.predictedMimeType) {
+      validation = { ok: false, error: "unsupported_file_extension_for_preview" };
     } else if (item.driveLink) {
       // Preview must be a fast, deterministic metadata/collision check. Media
       // downloads happen in bulkUpsert, where each item can report its own
@@ -8412,6 +8685,9 @@ app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => 
       validation = {
         ok: true,
         remoteValidation: "deferred_to_import",
+        sourceDriveFileId: resolvedRow.sourceDriveFileId,
+        idempotencyKey: resolvedRow.idempotencyKey,
+        predictedStoragePath: resolvedRow.predictedStoragePath,
       };
     }
     results.push({
