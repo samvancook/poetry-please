@@ -6187,7 +6187,7 @@ app.get(getBoth("/admin/contentFlags"), async (req, res) => {
 
   const allContent = await getAllContent();
   const contentById = new Map(allContent.map((item) => [normalizeKey(item.imageId || ""), item]));
-  const snap = await db.collection(COLLECTIONS.contentFlags).limit(250).get();
+  const snap = await db.collection(COLLECTIONS.contentFlags).limit(1000).get();
   const flags = snap.docs
     .map((doc) => {
       const data = doc.data() || {};
