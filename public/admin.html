@@ -700,6 +700,10 @@
           <button id="retry-import-assistant-failed" type="button" class="secondary" disabled>Retry failed rows</button>
           <button id="import-assistant-download" type="button" class="secondary">Download JSON</button>
           <button id="import-assistant-load-first" type="button" class="secondary">Load first into form</button>
+          <label style="display:flex;align-items:center;gap:8px;margin:0;">
+            <input id="import-assistant-force-replace" type="checkbox" style="width:auto;" />
+            Replace existing asset
+          </label>
         </div>
         <div class="hint">Use one filename per line, or tab-separated columns in this order: file name, author, book, title, Drive link, optional content ID. Validation shows the exact content ID, Drive file ID, and deterministic Storage path before import. Media bytes are fetched only after you confirm.</div>
         <textarea id="import-assistant-text" placeholder="CAMACHO - PE - QUOTE IMAGES - DRIFT - 1.png&#10;WTF - INT - hi-01.jpg"></textarea>
@@ -2563,7 +2567,11 @@
     async function runImportAssistantGraphics() {
       const statusEl = document.getElementById('import-assistant-status');
       const rows = state.importAssistantPreviewRows.length ? state.importAssistantPreviewRows : state.importAssistantResults;
-      const items = rows.filter((row) => row.validation?.ok && ['create', 'update'].includes(row.action)).map((row) => row.contentItem).filter(Boolean);
+      const forceAssetReplace = document.getElementById('import-assistant-force-replace').checked;
+      const items = rows
+        .filter((row) => row.validation?.ok && ['create', 'update'].includes(row.action))
+        .map((row) => row.contentItem ? { ...row.contentItem, forceAssetReplace: forceAssetReplace || row.contentItem.forceAssetReplace === true } : null)
+        .filter(Boolean);
       if (!items.length) {
         statusEl.textContent = 'Validate graphics first, then import the valid create/update rows.';
         statusEl.className = 'status error';
@@ -3790,6 +3798,7 @@
                     <button type="button" data-review-flag="${flag.id}" data-decision="approved" ${flag.status !== 'pending' ? 'disabled' : ''}>Re-approve</button>
                     <button type="button" class="secondary" data-review-flag="${flag.id}" data-decision="updated" ${flag.status !== 'pending' ? 'disabled' : ''}>Mark updated</button>
                   </div>
+                  <input type="text" data-review-note="${flag.id}" placeholder="Optional review note" ${flag.status !== 'pending' ? 'disabled' : ''} style="margin-top:10px;" />
                   <div class="actions" style="margin-top:10px;flex-wrap:wrap;">
                     <input type="file" accept="image/jpeg,image/png,image/webp,image/gif" data-replacement-file="${flag.id}" ${flag.status !== 'pending' || ['EXC', 'FP', 'VV', 'YT'].includes(flag.imageType || '') ? 'disabled' : ''} />
                     <button type="button" class="secondary" data-upload-replacement="${flag.id}" ${flag.status !== 'pending' || ['EXC', 'FP', 'VV', 'YT'].includes(flag.imageType || '') ? 'disabled' : ''}>Replace asset</button>
@@ -4077,9 +4086,7 @@
 
     async function reviewFlag(flagId, decision) {
       const statusEl = document.getElementById('flag-review-status');
-      const actionLabel = decision === 'approved' ? 're-approve' : 'mark as updated';
-      const note = window.prompt(`Optional note for this ${actionLabel} action:`, '');
-      if (note === null) return;
+      const note = document.querySelector(`[data-review-note="${CSS.escape(flagId)}"]`)?.value.trim() || '';
       statusEl.textContent = `${decision === 'approved' ? 'Re-approving' : 'Marking updated'}…`;
       statusEl.className = 'status';
       try {
