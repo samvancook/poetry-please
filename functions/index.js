@@ -8614,7 +8614,7 @@ function finalizeImportAssistantGraphicRow(row, remoteMedia = null) {
     : "");
   const sourceDriveFileId = normalizeText(row?.sourceDriveFileId)
     || extractGoogleDriveFileId(row?.driveLink || "");
-  const predictedMimeType = normalizeText(remoteMedia?.mimeType)
+  const predictedMimeType = normalizeText(remoteMedia?.mimeType || row?.predictedMimeType)
     || inferRemoteMimeType("", effectiveFileName, row?.driveLink || "", UPLOAD_RULES.libraryGraphic);
   const storagePath = effectiveDocId
     ? deterministicGraphicStoragePath({
