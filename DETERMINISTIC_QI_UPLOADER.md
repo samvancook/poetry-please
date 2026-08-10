@@ -88,13 +88,16 @@ The canary also established three required production safeguards: preview reads 
 - 2014: 8 of 8 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library.
 - 2015: 25 of 25 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library.
 - 2016: 111 of 111 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. This includes 107 rows processed in measured batches plus four earlier rows re-verified during closeout.
+- 2017: 239 of 239 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. The remaining 371 source-year rows stay deferred because they still require poem matching.
 
-Production behavior confirmed during the 2016 rollout:
+Production behavior confirmed during the 2016–2017 rollout:
 
 - Source Drive identity wins before metadata matching, so distinct QIs for the same poem do not overwrite one another.
 - Confirmed same-poem variants use explicit, collision-checked canonical `-V2`, `-V3`, and later IDs when needed.
+- Variant allocation reads the complete Firestore document-ID family for every proposed base ID before assigning a suffix, including variants created in earlier batches.
+- Public content retains `bookShortener` through its Firestore projection so same-title editions, such as `HELI` (2017) and `HLE` (2021), resolve to the correct catalog. Projection changes bump the durable content-snapshot version so stale snapshots cannot preserve the old mapping.
 - Known-broken IDs force a fresh Storage upload; the exact ID is removed from the broken-content manifest only after the job reports a new Storage path and the public image is verified.
 - A public `contentById` cache miss performs one exact Firestore document lookup before returning 404. It does not rebuild the full content snapshot for an unknown ID, and newly imported canonical IDs resolve immediately across Cloud Run instances.
 - A year is complete only after the QI Library records the public image URL, `cloud_upload_verified`, canonical content ID, `firestore_verified_public`, verification timestamp, and batch note for every ready row.
 
-Next recommended year tranches are 2017 (239 ready rows), 2018 (187), 2019 (306), 2020 (231), 2021 (603), 2022 (574), 2023 (317), 2024 (268), 2025 (360), and 2026 (126). Within a year, use 25-row upload jobs and finish public/API/image/library verification before starting the next job.
+Next recommended year tranches are 2018 (187 ready rows), 2019 (306), 2020 (231), 2021 (603), 2022 (574), 2023 (317), 2024 (268), 2025 (360), and 2026 (126). Within a year, use 25-row upload jobs and finish public/API/image/library verification before starting the next job.

@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 // Firebase Admin v12 (modular)
 import { initializeApp } from "firebase-admin/app";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { getFirestore, FieldPath, FieldValue } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
 import { getStorage, getDownloadURL } from "firebase-admin/storage";
 import { GoogleAuth, Impersonated } from "google-auth-library";
@@ -111,7 +111,9 @@ const CONTENT_CACHE_TTL_MS = 15 * 60 * 1000;
 const CONTENT_SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000;
 const CONTENT_SNAPSHOT_DOC_ID = "content-feed";
 const CONTENT_SNAPSHOT_PATH = "system/content-feed/latest.json";
-const CONTENT_SNAPSHOT_VERSION = 1;
+// Bump when the public content projection changes so older durable snapshots
+// cannot keep serving records shaped by the previous parser.
+const CONTENT_SNAPSHOT_VERSION = 2;
 const FLAGGED_CONTENT_CACHE_TTL_MS = 2 * 60 * 1000;
 const RATINGS_CACHE_TTL_MS = 2 * 60 * 1000;
 const SCOREBOARD_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -363,6 +365,7 @@ function parseDoc(snap) {
     sourceFileName: d.sourceFileName || "",
     misc: d.misc || "",
     bookLink: d.bookLink || "",
+    bookShortener: d.bookShortener || "",
     releaseCatalog: d.releaseCatalog || "",
     sourceEvent: d.sourceEvent || "",
     sourceEventLabel: d.sourceEventLabel || "",
@@ -4145,6 +4148,22 @@ async function getExistingGraphicsForImportRows(rows = []) {
   for (let start = 0; start < exactRefs.length; start += 100) {
     const snapshots = await db.getAll(...exactRefs.slice(start, start + 100));
     snapshots.filter((snap) => snap.exists).forEach((snap) => remember(mapAdminContentDoc(COLLECTIONS.graphics, snap)));
+  }
+
+  // Variant allocation must see every existing member of a poem's ID family,
+  // not just the unsuffixed base ID or the recent-admin sample. Otherwise a
+  // later batch can reuse `-V2`, `-V3`, and so on from an earlier batch.
+  const baseIds = uniq(rows.map((row) => (
+    sanitizeDocIdSegment(row?.contentItem?.docId || row?.suggestedDocId || "")
+      .replace(/-V\d+$/i, "")
+  )).filter(Boolean));
+  for (const baseId of baseIds) {
+    const familySnap = await db.collection(COLLECTIONS.graphics)
+      .orderBy(FieldPath.documentId())
+      .startAt(baseId)
+      .endAt(`${baseId}\uf8ff`)
+      .get();
+    familySnap.docs.forEach((doc) => remember(mapAdminContentDoc(COLLECTIONS.graphics, doc)));
   }
 
   // Provenance-aware source matching catches a Drive file that was previously
