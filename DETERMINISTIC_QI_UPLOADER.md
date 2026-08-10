@@ -71,3 +71,14 @@ The old Apps Script remains useful as a row-selection and manifest-preparation m
 4. Verify the job result, Storage object, Firestore document, public `contentById`, and cache refresh.
 5. Re-run the exact manifest and confirm the same batch and object are reused.
 6. Only then proceed with larger prepared selections.
+
+## Verified production canary — 2026-08-10
+
+- Content ID: `ASAB-QI-GHAZAL-FOR-MY-GRANDMOTHER`
+- Source Drive file ID: `1rcv3dW39yEtb3ZNnv7eXCkSPbK80rFQi`
+- Deterministic Storage path: `content-library/graphics/asab-qi-ghazal-for-my-grandmother/ASAB-QI-GHAZAL-FOR-MY-GRANDMOTHER.png`
+- Batch ID: `batch-bea6c5f0a7dc070f9a2f6120`
+- Verified the public PNG response (`image/png`, 123,394 bytes), Storage provenance metadata, Firestore fields, public `contentById` response, and QI Library audit row.
+- Re-submitting the identical manifest returned the same batch ID and existing object; it did not create a second job, Firestore identity, or Storage asset.
+
+The canary also established three required production safeguards: preview reads authenticated Drive MIME metadata for extensionless filenames, preview matching preserves that MIME through collision assignment, and public-content cache reads compare a durable snapshot generation so Cloud Run instances cannot retain an obsolete in-memory snapshot after an import.
