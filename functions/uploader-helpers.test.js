@@ -11,6 +11,7 @@ import {
   normalizeStorageObjectName,
   preserveExistingImportValues,
   shouldCreateSuppliedGraphicVariant,
+  shouldForceGraphicAssetReplacement,
 } from "./uploader-helpers.js";
 
 const graphicRules = {
@@ -84,6 +85,23 @@ test("an explicit unused graphic ID creates a distinct same-poem variant", () =>
     sourceMatchCount: 1,
   }), false);
   assert.equal(shouldCreateSuppliedGraphicVariant({ suppliedDocId: "", sourceMatchCount: 0 }), false);
+});
+
+test("known-broken QI IDs force a fresh asset upload", () => {
+  const brokenIds = new Set(["ond-qi-ocd-v2"]);
+  assert.equal(shouldForceGraphicAssetReplacement({
+    docId: "OND-QI-OCD-V2",
+    brokenIds,
+  }), true);
+  assert.equal(shouldForceGraphicAssetReplacement({
+    docId: "OND-QI-MEMORIAL-DAY",
+    brokenIds,
+  }), false);
+  assert.equal(shouldForceGraphicAssetReplacement({
+    docId: "OND-QI-MEMORIAL-DAY",
+    requestedForce: true,
+    brokenIds,
+  }), true);
 });
 
 test("storage object normalization preserves the proven Apps Script filename rules", () => {

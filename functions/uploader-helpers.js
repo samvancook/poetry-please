@@ -106,6 +106,22 @@ export function shouldCreateSuppliedGraphicVariant({ suppliedDocId = "", sourceM
   return !!normalizeText(suppliedDocId) && Number(sourceMatchCount || 0) === 0;
 }
 
+export function shouldForceGraphicAssetReplacement({
+  docId = "",
+  requestedForce = false,
+  brokenIds = [],
+} = {}) {
+  if (requestedForce) return true;
+  const normalizedDocId = normalizeImportMatchValue(docId).replace(/\s+/g, "-");
+  if (!normalizedDocId) return false;
+  const normalizedBrokenIds = brokenIds instanceof Set
+    ? brokenIds
+    : new Set((Array.isArray(brokenIds) ? brokenIds : []).map((value) => (
+      normalizeImportMatchValue(value).replace(/\s+/g, "-")
+    )));
+  return normalizedBrokenIds.has(normalizedDocId);
+}
+
 export function inferRemoteMimeType(contentType = "", fileName = "", sourceUrl = "", rules = null) {
   const rawType = String(contentType || "").split(";")[0].trim().toLowerCase();
   if (rules?.allowedMimeTypes?.has(rawType)) return rawType;

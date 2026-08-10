@@ -24,6 +24,7 @@ import {
   isCacheGenerationCurrent,
   preserveExistingImportValues,
   shouldCreateSuppliedGraphicVariant,
+  shouldForceGraphicAssetReplacement,
 } from "./uploader-helpers.js";
 
 /** ====== CONFIG / CONSTANTS ====== */
@@ -8702,6 +8703,11 @@ function finalizeImportAssistantGraphicRow(row, remoteMedia = null) {
       sourceSystem: normalizeText(row?.sourceSystem || "poetry_please_admin"),
       sourceRecordId: normalizeText(row?.sourceRecordId || sourceDriveFileId || effectiveDocId),
       idempotencyKey,
+      forceAssetReplace: shouldForceGraphicAssetReplacement({
+        docId: effectiveDocId,
+        requestedForce: row?.forceAssetReplace === true || row?.contentItem?.forceAssetReplace === true,
+        brokenIds: BROKEN_QI_IDS,
+      }),
       predictedStoragePath: storagePath,
       pageNumber: normalizeText(row?.pageNumber || ""),
       bookShortener: normalizeText(row?.bookShortener || ""),
