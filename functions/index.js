@@ -4952,15 +4952,34 @@ app.get(getBoth("/contentById"), async (req, res) => {
   const targetId = normalizeText(req.query?.id);
   if (!targetId) return res.status(400).json({ error: "missing_id" });
 
-  const [allContent, flaggedIds] = await Promise.all([
+  const [cachedContent, flaggedIds] = await Promise.all([
     getAllContentCached(),
     getFlaggedContentIds(),
   ]);
-  const all = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
   const normalizedTarget = normalizeKey(targetId);
-  const item = all.find((entry) =>
+  const findVisibleItem = (items) => excludeBrokenContent(excludeFlaggedContent(items, flaggedIds)).find((entry) =>
     normalizeKey(entry.imageId) === normalizedTarget || normalizeKey(entry.contentId) === normalizedTarget
   );
+
+  // A completed import can land on a different Cloud Run instance than the
+  // subsequent public lookup. If durable cache invalidation has not reached
+  // that instance yet, retry an actual miss by exact Firestore document ID
+  // before returning 404. This avoids rebuilding the entire content snapshot
+  // for ordinary unknown IDs while making newly imported canonical IDs
+  // immediately resolvable.
+  let item = findVisibleItem(cachedContent);
+  if (!item) {
+    const directSnaps = await Promise.all([
+      COLLECTIONS.graphics,
+      COLLECTIONS.excerpts,
+      COLLECTIONS.fullPoems,
+      COLLECTIONS.videos,
+    ].map((collection) => db.collection(collection).doc(targetId).get()));
+    const directSnap = directSnaps.find((snap) => snap.exists);
+    if (directSnap) {
+      item = findVisibleItem([canonicalizeContentRecord({ id: directSnap.id, ...parseDoc(directSnap) })]);
+    }
+  }
 
   if (!item) return res.status(404).json({ error: "not_found" });
 
