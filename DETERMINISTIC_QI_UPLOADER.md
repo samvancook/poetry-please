@@ -57,7 +57,9 @@ The filename normalization matches the proven Apps Script behavior: whitespace b
 
 ## Human surface
 
-The Poetry Please Import Assistant accepts pasted Sheet rows, previews the deterministic IDs and paths, imports valid create/update rows, displays per-row results, and exposes **Retry failed rows**. It processes two items per request so a slow Drive file cannot exceed the browser request deadline.
+The Poetry Please Import Assistant accepts pasted Sheet rows, previews the deterministic IDs and paths, imports valid create/update rows, displays per-row results, and exposes **Retry failed rows**. When called through Firebase Hosting, it processes one item per request so a slow Drive file cannot exceed the gateway's 60-second request deadline. The durable job still contains the whole prepared tranche, and completed rows are never replayed.
+
+Before a production tranche, use the read-only **Drive access diagnostic** with one source file. It must identify the production service account and return successful metadata and authenticated media reads. This catches Drive permission or deployment drift before any Storage or Firestore write.
 
 ## Spreadsheet role
 
@@ -89,6 +91,7 @@ The canary also established three required production safeguards: preview reads 
 - 2015: 25 of 25 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library.
 - 2016: 111 of 111 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. This includes 107 rows processed in measured batches plus four earlier rows re-verified during closeout.
 - 2017: 239 of 239 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. The remaining 371 source-year rows stay deferred because they still require poem matching.
+- 2018: 187 of 187 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. The remaining 104 source-year rows stay deferred because they still require poem matching or other enrichment. The final seven Claire Schwartz rows were written by batch `batch-1c38739185faf647c0cf85f8` after the authenticated Drive diagnostic verified the production service identity and source media access.
 
 Production behavior confirmed during the 2016–2017 rollout:
 
@@ -99,5 +102,7 @@ Production behavior confirmed during the 2016–2017 rollout:
 - Known-broken IDs force a fresh Storage upload; the exact ID is removed from the broken-content manifest only after the job reports a new Storage path and the public image is verified.
 - A public `contentById` cache miss performs one exact Firestore document lookup before returning 404. It does not rebuild the full content snapshot for an unknown ID, and newly imported canonical IDs resolve immediately across Cloud Run instances.
 - A year is complete only after the QI Library records the public image URL, `cloud_upload_verified`, canonical content ID, `firestore_verified_public`, verification timestamp, and batch note for every ready row.
+- Malformed smart quotes in pasted Sheet text can collapse several tab-separated rows into one parse result. Correct the source cell, reread it, and re-preview; do not edit around the parse failure inside the importer.
+- When a legacy poem-title family already contains ambiguous IDs, preview explicit candidate variants and import only the first collision-free ID. The 2018 `CAMARO` row was safely created as `DT-QI-CAMARO-V6`; existing `V2` and `V4` records were not overwritten.
 
-Next recommended year tranches are 2018 (187 ready rows), 2019 (306), 2020 (231), 2021 (603), 2022 (574), 2023 (317), 2024 (268), 2025 (360), and 2026 (126). Within a year, use 25-row upload jobs and finish public/API/image/library verification before starting the next job.
+Next recommended year tranches are 2019 (306 ready rows), 2020 (231), 2021 (603), 2022 (575), 2023 (318), 2024 (268), 2025 (402), and 2026 (126). Within a year, use 25-row upload jobs and finish public/API/image/library verification before starting the next job.

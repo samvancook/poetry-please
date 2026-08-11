@@ -2536,7 +2536,10 @@
       do {
         processPayload = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}/process`, {
           method: 'POST',
-          body: { limit: 2 },
+          // Keep each synchronous processing request below the hosting gateway's
+          // 60-second ceiling. Individual Drive + Storage stages have bounded
+          // deadlines, but two worst-case assets can still exceed that ceiling.
+          body: { limit: 1 },
           timeoutMs: 120000,
         });
         const counts = processPayload.counts || {};
