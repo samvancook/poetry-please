@@ -661,6 +661,16 @@
       </div>
       <div id="import-assistant-section-body">
         <p class="lede" style="margin-bottom:16px;max-width:none;">Paste filenames or tab-separated rows to get a first-pass catalog match before import.</p>
+        <div class="drawer-section" style="margin-bottom:16px;">
+          <h3>QI Library yearly queue</h3>
+          <p class="hint">Load the next 25 ready, not-yet-verified rows directly from the QI Library. Completed rows are excluded automatically.</p>
+          <div class="controls">
+            <input id="import-assistant-library-year" type="number" min="2000" max="2100" value="2019" placeholder="2019" />
+            <button id="load-import-assistant-library-year" type="button">Load next 25</button>
+            <button id="resume-import-assistant-batch" type="button" class="secondary" disabled>Resume latest batch</button>
+          </div>
+          <div id="import-assistant-library-status" class="status">No QI Library year loaded yet.</div>
+        </div>
         <div class="form-grid" style="margin-bottom:14px;">
           <label>
             Drive folder link
@@ -922,6 +932,35 @@
       return res.json();
     }
 
+    async function longRunningApi(path, { method = "POST", body, timeoutMs = 525000 } = {}) {
+      const token = await getIdTokenOrNull();
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const directBase = `https://us-central1-${FIREBASE_CONFIG.projectId}.cloudfunctions.net/api/api`;
+      let res;
+      try {
+        res = await fetch(`${directBase}/${path.replace(/^\//, "")}`, {
+          method,
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        if (err?.name === 'AbortError') throw new Error(`Server runner timed out after ${Math.round(timeoutMs / 1000)} seconds. The durable batch can be resumed without replaying completed rows.`);
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok && res.status !== 202) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`Server runner failed: ${res.status} ${text}`);
+      }
+      return res.json();
+    }
+
     function collapsedByDefault(storageKey) {
       return localStorage.getItem(storageKey) !== 'open';
     }
@@ -952,7 +991,8 @@
       submissionTypeFilter: "all",
       importAssistantResults: [],
       importAssistantPreviewRows: [],
-      importAssistantBatchId: "",
+      importAssistantBatchId: localStorage.getItem('pp_admin_last_import_batch_id') || "",
+      importAssistantSourceRows: [],
       contentItems: [],
       contentTotalCount: 0,
       contentType: "all",
@@ -2390,6 +2430,8 @@
                   <div>${escapeHtml(row.jobResult.state || '—')}${row.jobResult.result?.action ? ` · ${escapeHtml(row.jobResult.result.action)}` : ''}</div>
                   ${row.jobResult.result?.assetReused ? '<div class="meta">Storage object reused</div>' : ''}
                   ${row.jobResult.result?.storagePath ? `<div class="meta">${escapeHtml(row.jobResult.result.storagePath)}</div>` : ''}
+                  ${row.jobResult.result?.verification?.ok ? `<div class="meta" style="color:#2f6f44;">Public metadata + image verified</div>` : ''}
+                  ${row.jobResult.result?.libraryWriteback?.verified ? `<div class="meta" style="color:#2f6f44;">QI Library row ${escapeHtml(row.jobResult.result.libraryWriteback.rowNumber)} recorded</div>` : ''}
                   ${row.jobResult.error ? `<div class="meta" style="color:#9a3f2d;">${escapeHtml(row.jobResult.error)}</div>` : ''}
                 ` : '—'}</td>
                 <td><button type="button" class="secondary" data-import-assistant-use="${escapeHtml(row.index)}">Use in form</button></td>
@@ -2447,6 +2489,49 @@
       }
     }
 
+    async function loadImportAssistantLibraryYear() {
+      const year = document.getElementById('import-assistant-library-year').value.trim();
+      const libraryStatusEl = document.getElementById('import-assistant-library-status');
+      if (!/^20\d{2}$/.test(year)) {
+        libraryStatusEl.textContent = 'Enter a four-digit release year.';
+        libraryStatusEl.className = 'status error';
+        return;
+      }
+      libraryStatusEl.textContent = `Loading the next ready ${year} rows from the QI Library…`;
+      libraryStatusEl.className = 'status';
+      try {
+        const payload = await api(`admin/importAssistant/qiLibraryYear?year=${encodeURIComponent(year)}&limit=25&offset=0`, { timeoutMs: 60000 });
+        state.importAssistantSourceRows = payload.rows || [];
+        document.getElementById('import-assistant-text').value = state.importAssistantSourceRows.map((row) => [
+          row.fileName || '',
+          row.author || '',
+          row.book || '',
+          row.title || '',
+          row.driveLink || '',
+        ].join('\t')).join('\n');
+        libraryStatusEl.textContent = `${payload.readyCount} ready ${year} rows; ${payload.remainingCount} remain. Loaded ${state.importAssistantSourceRows.length} for this job.`;
+        libraryStatusEl.className = state.importAssistantSourceRows.length ? 'status success' : 'status';
+        if (state.importAssistantSourceRows.length) await previewImportAssistantGraphics(state.importAssistantSourceRows);
+      } catch (err) {
+        console.error(err);
+        libraryStatusEl.textContent = err.message || 'Could not load the QI Library year.';
+        libraryStatusEl.className = 'status error';
+      }
+    }
+
+    async function refreshImportAssistantLibraryYearStatus() {
+      const year = document.getElementById('import-assistant-library-year').value.trim();
+      if (!/^20\d{2}$/.test(year)) return;
+      try {
+        const payload = await api(`admin/importAssistant/qiLibraryYear?year=${encodeURIComponent(year)}&limit=1&offset=0`, { timeoutMs: 60000 });
+        const libraryStatusEl = document.getElementById('import-assistant-library-status');
+        libraryStatusEl.textContent = `${payload.readyCount} ready ${year} rows; ${payload.remainingCount} remain after the latest verified batch.`;
+        libraryStatusEl.className = payload.remainingCount ? 'status success' : 'status';
+      } catch (err) {
+        console.warn('Could not refresh QI Library year status', err);
+      }
+    }
+
     async function runImportAssistant() {
       const statusEl = document.getElementById('import-assistant-status');
       const rows = parseImportAssistantRows(document.getElementById('import-assistant-text').value);
@@ -2458,6 +2543,7 @@
       }
       statusEl.textContent = 'Resolving metadata…';
       statusEl.className = 'status';
+      state.importAssistantSourceRows = [];
       state.importAssistantBatchId = '';
       document.getElementById('retry-import-assistant-failed').disabled = true;
       document.getElementById('retry-import-assistant-failed').textContent = 'Retry failed rows';
@@ -2487,9 +2573,13 @@
       }
     }
 
-    async function previewImportAssistantGraphics() {
+    async function previewImportAssistantGraphics(sourceRows = null) {
       const statusEl = document.getElementById('import-assistant-status');
-      const rows = parseImportAssistantRows(document.getElementById('import-assistant-text').value);
+      const rows = Array.isArray(sourceRows) && sourceRows.length
+        ? sourceRows
+        : (state.importAssistantSourceRows.length
+          ? state.importAssistantSourceRows
+          : parseImportAssistantRows(document.getElementById('import-assistant-text').value));
       if (!rows.length) {
         statusEl.textContent = 'Paste at least one row.';
         statusEl.className = 'status error';
@@ -2532,39 +2622,54 @@
     }
 
     async function processImportAssistantJob(batchId, itemCount, statusEl) {
-      let processPayload = null;
-      do {
-        processPayload = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}/process`, {
-          method: 'POST',
-          // Keep each synchronous processing request below the hosting gateway's
-          // 60-second ceiling. Individual Drive + Storage stages have bounded
-          // deadlines, but two worst-case assets can still exceed that ceiling.
-          body: { limit: 1 },
-          timeoutMs: 120000,
-        });
-        const counts = processPayload.counts || {};
-        statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0}/${itemCount} complete, ${counts.failed || 0} failed…`;
-      } while ((processPayload.counts?.pending || 0) > 0);
-
-      const snapshot = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}`);
+      statusEl.textContent = `Batch ${batchId} is running server-side. The job will verify public records and update the QI Library before it finishes…`;
+      statusEl.className = 'status';
+      const run = await longRunningApi(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}/run`);
+      const snapshot = run.snapshot || await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}`);
       applyImportJobResults(snapshot);
-      const counts = processPayload?.counts || {};
+      const counts = run.counts || snapshot.job || {};
       const failed = (snapshot.items || []).filter((item) => item.state === 'failed');
-      const publishError = processPayload?.publishError || snapshot.job?.publishError || '';
+      const publishError = run.publishError || snapshot.job?.publishError || '';
+      const verifiedCount = (snapshot.items || []).filter((item) => item.result?.verification?.ok).length;
+      const writebackCount = (snapshot.items || []).filter((item) => item.result?.libraryWriteback?.verified).length;
       const retryButton = document.getElementById('retry-import-assistant-failed');
       retryButton.disabled = failed.length === 0 && !publishError;
       retryButton.textContent = publishError && !failed.length ? 'Retry publication' : 'Retry failed rows';
-      if (publishError) {
+      if (run.timedOut) {
+        statusEl.textContent = `Batch ${batchId} reached the server-runner window with work still pending. Use Resume latest batch; completed rows will not replay.`;
+        statusEl.className = 'status error';
+        document.getElementById('resume-import-assistant-batch').disabled = false;
+      } else if (publishError) {
         statusEl.textContent = `Batch ${batchId}: records completed, but Poetry Please cache publication failed — ${publishError}. Run processing again to retry publication; completed rows will not be uploaded again.`;
         statusEl.className = 'status error';
       } else if (failed.length) {
         statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || 0} complete, ${failed.length} failed — ${failed.map((item) => `${item.requestedId || item.itemId}: ${item.error || 'import_failed'}${item.status ? ` (${item.status})` : ''}`).join(' | ')}`;
         statusEl.className = 'status error';
       } else {
-        statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || itemCount} complete, 0 failed.`;
+        statusEl.textContent = `Batch ${batchId}: ${counts.completedCount || itemCount} complete, ${verifiedCount} publicly verified, ${writebackCount} QI Library rows recorded, 0 failed.`;
         statusEl.className = 'status success';
+        if (writebackCount) await refreshImportAssistantLibraryYearStatus();
       }
       return snapshot;
+    }
+
+    async function resumeImportAssistantBatch() {
+      const statusEl = document.getElementById('import-assistant-status');
+      const batchId = state.importAssistantBatchId || localStorage.getItem('pp_admin_last_import_batch_id') || '';
+      if (!batchId) {
+        statusEl.textContent = 'No saved import batch is available.';
+        statusEl.className = 'status error';
+        return;
+      }
+      state.importAssistantBatchId = batchId;
+      try {
+        const snapshot = await api(`admin/contentLibrary/importJobs/${encodeURIComponent(batchId)}`);
+        await processImportAssistantJob(batchId, Number(snapshot.job?.itemCount || snapshot.items?.length || 0), statusEl);
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = err.message || 'Could not resume the saved batch.';
+        statusEl.className = 'status error';
+      }
     }
 
     async function runImportAssistantGraphics() {
@@ -2589,6 +2694,8 @@
           body: { type: 'graphics', items },
         });
         state.importAssistantBatchId = job.batchId;
+        localStorage.setItem('pp_admin_last_import_batch_id', job.batchId);
+        document.getElementById('resume-import-assistant-batch').disabled = false;
         await processImportAssistantJob(job.batchId, items.length, statusEl);
         document.getElementById('run-import-assistant-graphics').disabled = true;
       } catch (err) {
@@ -4281,12 +4388,18 @@
         if (event.target.id === "author-detail-drawer") closeAuthorDetail();
       });
       document.getElementById("run-import-assistant").addEventListener("click", () => runImportAssistant());
+      document.getElementById("load-import-assistant-library-year").addEventListener("click", () => loadImportAssistantLibraryYear());
+      document.getElementById("resume-import-assistant-batch").addEventListener("click", () => resumeImportAssistantBatch());
       document.getElementById("run-drive-diagnostic").addEventListener("click", () => runDriveDiagnostic());
       document.getElementById("preview-import-assistant-graphics").addEventListener("click", () => previewImportAssistantGraphics());
       document.getElementById("run-import-assistant-graphics").addEventListener("click", () => runImportAssistantGraphics());
       document.getElementById("retry-import-assistant-failed").addEventListener("click", () => retryImportAssistantFailed());
       document.getElementById("import-assistant-download").addEventListener("click", () => downloadImportAssistantJson());
       document.getElementById("import-assistant-load-first").addEventListener("click", () => loadFirstImportAssistantRowIntoForm());
+      document.getElementById("import-assistant-text").addEventListener("input", () => {
+        state.importAssistantSourceRows = [];
+      });
+      document.getElementById("resume-import-assistant-batch").disabled = !state.importAssistantBatchId;
       document.getElementById("users-toggle").addEventListener("click", () => {
         state.usersCollapsed = !state.usersCollapsed;
         saveCollapseState('pp_admin_users_collapsed', state.usersCollapsed);

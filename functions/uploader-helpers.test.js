@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildQiLibraryWritebackValues,
   canonicalImportManifestJson,
   contentIdSlug,
   deterministicGraphicStoragePath,
@@ -13,6 +14,8 @@ import {
   preserveExistingImportValues,
   shouldCreateSuppliedGraphicVariant,
   shouldForceGraphicAssetReplacement,
+  selectQiLibraryYearRows,
+  validateImportedGraphic,
 } from "./uploader-helpers.js";
 
 const graphicRules = {
@@ -179,4 +182,70 @@ test("cross-instance cache generations reject invalidated or newer snapshots", (
   assert.equal(isCacheGenerationCurrent({ sourceBuiltAtMs: 200, snapshotBuiltAtMs: 200, invalidatedAtMs: 100 }), true);
   assert.equal(isCacheGenerationCurrent({ sourceBuiltAtMs: 200, snapshotBuiltAtMs: 0, invalidatedAtMs: 250 }), false);
   assert.equal(isCacheGenerationCurrent({ sourceBuiltAtMs: 200, snapshotBuiltAtMs: 300, invalidatedAtMs: 100 }), false);
+});
+
+test("year loader selects only unverified ready QI rows and retains sheet identity", () => {
+  const header = Array(35).fill("");
+  const ready = Array(35).fill("");
+  ready[0] = "2019";
+  ready[4] = "Example.png";
+  ready[5] = "https://drive.google.com/file/d/drive-1/view";
+  ready[6] = "drive-1";
+  ready[11] = "Example Book";
+  ready[12] = "Spring 2019";
+  ready[15] = "Example Author";
+  ready[16] = "EX";
+  ready[20] = "ready_for_poetry_please_ingestion";
+  ready[22] = "Example Poem";
+  const complete = [...ready];
+  complete[4] = "Complete.png";
+  complete[29] = "https://example.com/complete.png";
+  complete[30] = "cloud_upload_verified";
+  complete[31] = "EX-QI-COMPLETE";
+  complete[32] = "firestore_verified_public";
+  const deferred = [...ready];
+  deferred[4] = "Deferred.png";
+  deferred[20] = "deferred_requires_new_matching_tools";
+
+  const selection = selectQiLibraryYearRows([header, ready, complete, deferred], { year: "2019", limit: 25 });
+  assert.equal(selection.sourceYearCount, 3);
+  assert.equal(selection.readyCount, 2);
+  assert.equal(selection.remainingCount, 1);
+  assert.equal(selection.rows.length, 1);
+  assert.equal(selection.rows[0].sourceSpreadsheetRow, 2);
+  assert.equal(selection.rows[0].sourceDriveFileId, "drive-1");
+  assert.equal(selection.rows[0].title, "Example Poem");
+});
+
+test("automatic graphic verification requires matching metadata and a working image", () => {
+  const valid = validateImportedGraphic({
+    requested: { docId: "EX-QI-POEM", author: "Example Author", book: "Example Book", title: "Poem", releaseCatalog: "Spring 2019", imageType: "QI" },
+    saved: { id: "EX-QI-POEM", author: "Example Author", book: "Example Book", title: "Poem", releaseCatalog: "Spring 2019", imageType: "QI", imageUrl: "https://example.com/image.png" },
+    imageStatus: 200,
+    imageContentType: "image/png",
+  });
+  assert.equal(valid.ok, true);
+  assert.equal(validateImportedGraphic({
+    requested: { docId: "EX-QI-POEM", title: "Poem" },
+    saved: { id: "EX-QI-POEM", title: "Wrong", imageUrl: "https://example.com/image.png" },
+    imageStatus: 200,
+    imageContentType: "image/png",
+  }).ok, false);
+});
+
+test("QI Library writeback has the canonical six audit values", () => {
+  assert.deepEqual(buildQiLibraryWritebackValues({
+    imageUrl: "https://example.com/image.png",
+    docId: "EX-QI-POEM",
+    verifiedAt: "2026-08-11T18:00:00Z",
+    batchId: "batch-example",
+    action: "created",
+  }), [
+    "https://example.com/image.png",
+    "cloud_upload_verified",
+    "EX-QI-POEM",
+    "firestore_verified_public",
+    "2026-08-11T18:00:00Z",
+    "Production Import Assistant batch batch-example; created; automatic public metadata and image verification passed.",
+  ]);
 });

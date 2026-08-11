@@ -136,6 +136,107 @@ export function nextAvailableGraphicVariantId({ baseId = "", unavailableIds = []
   throw new Error("graphic_variant_limit_exceeded");
 }
 
+const QI_LIBRARY_COLUMN = {
+  releaseYear: 0,
+  authorFolder: 2,
+  poemTitleCandidate: 3,
+  fileName: 4,
+  driveLink: 5,
+  driveFileId: 6,
+  sourceFolderLink: 8,
+  book: 11,
+  releaseCatalog: 12,
+  normalizedAuthor: 15,
+  bookShortener: 16,
+  bookLink: 17,
+  readiness: 20,
+  canonicalPoemTitle: 22,
+  cloudStorageUrl: 29,
+  cloudUploadStatus: 30,
+  firestoreDocumentId: 31,
+  firestoreStatus: 32,
+};
+
+export function selectQiLibraryYearRows(values = [], { year = "", offset = 0, limit = 25 } = {}) {
+  const normalizedYear = normalizeText(year);
+  const safeOffset = Math.max(Number(offset) || 0, 0);
+  const safeLimit = Math.min(Math.max(Number(limit) || 25, 1), 100);
+  const sourceRows = (Array.isArray(values) ? values : [])
+    .map((cells, index) => ({ cells: Array.isArray(cells) ? cells : [], rowNumber: index + 1 }))
+    .filter(({ rowNumber, cells }) => rowNumber > 1 && normalizeText(cells[QI_LIBRARY_COLUMN.releaseYear]) === normalizedYear);
+  const readyRows = sourceRows.filter(({ cells }) => (
+    normalizeText(cells[QI_LIBRARY_COLUMN.readiness]) === "ready_for_poetry_please_ingestion"
+  ));
+  const remainingRows = readyRows.filter(({ cells }) => !(
+    normalizeText(cells[QI_LIBRARY_COLUMN.cloudStorageUrl])
+    && normalizeText(cells[QI_LIBRARY_COLUMN.cloudUploadStatus]) === "cloud_upload_verified"
+    && normalizeText(cells[QI_LIBRARY_COLUMN.firestoreDocumentId])
+    && normalizeText(cells[QI_LIBRARY_COLUMN.firestoreStatus]) === "firestore_verified_public"
+  ));
+  const rows = remainingRows.slice(safeOffset, safeOffset + safeLimit).map(({ cells, rowNumber }) => ({
+    fileName: normalizeText(cells[QI_LIBRARY_COLUMN.fileName]),
+    author: normalizeText(cells[QI_LIBRARY_COLUMN.normalizedAuthor] || cells[QI_LIBRARY_COLUMN.authorFolder]),
+    book: normalizeText(cells[QI_LIBRARY_COLUMN.book]),
+    title: normalizeText(cells[QI_LIBRARY_COLUMN.canonicalPoemTitle] || cells[QI_LIBRARY_COLUMN.poemTitleCandidate]),
+    driveLink: normalizeText(cells[QI_LIBRARY_COLUMN.driveLink]),
+    sourceDriveFileId: normalizeText(cells[QI_LIBRARY_COLUMN.driveFileId]),
+    folderLink: normalizeText(cells[QI_LIBRARY_COLUMN.sourceFolderLink]),
+    bookLink: normalizeText(cells[QI_LIBRARY_COLUMN.bookLink]),
+    releaseCatalog: normalizeText(cells[QI_LIBRARY_COLUMN.releaseCatalog]),
+    bookShortener: normalizeText(cells[QI_LIBRARY_COLUMN.bookShortener]),
+    sourceSystem: "qi_library",
+    sourceRecordId: `qi-library-row-${rowNumber}`,
+    sourceSpreadsheetRow: rowNumber,
+  }));
+  return {
+    year: normalizedYear,
+    sourceYearCount: sourceRows.length,
+    readyCount: readyRows.length,
+    remainingCount: remainingRows.length,
+    offset: safeOffset,
+    limit: safeLimit,
+    rows,
+  };
+}
+
+export function validateImportedGraphic({ requested = {}, saved = {}, imageStatus = 0, imageContentType = "" } = {}) {
+  const expectedId = normalizeText(requested.docId || requested.imageId);
+  const savedId = normalizeText(saved.id || saved.contentId || saved.imageId);
+  const expectedFields = ["author", "book", "title", "releaseCatalog", "imageType"];
+  const mismatchedFields = expectedFields.filter((field) => {
+    const expected = normalizeText(requested[field]);
+    return expected && normalizeText(saved[field]) !== expected;
+  });
+  const imageUrl = normalizeText(saved.imageUrl);
+  const normalizedContentType = normalizeText(imageContentType).toLowerCase();
+  return {
+    ok: !!expectedId
+      && normalizeText(savedId).toLowerCase() === expectedId.toLowerCase()
+      && !mismatchedFields.length
+      && !!imageUrl
+      && Number(imageStatus) >= 200
+      && Number(imageStatus) < 400
+      && normalizedContentType.startsWith("image/"),
+    expectedId,
+    savedId,
+    mismatchedFields,
+    imageUrl,
+    imageStatus: Number(imageStatus) || 0,
+    imageContentType: normalizedContentType,
+  };
+}
+
+export function buildQiLibraryWritebackValues({ imageUrl = "", docId = "", verifiedAt = "", batchId = "", action = "" } = {}) {
+  return [
+    normalizeText(imageUrl),
+    "cloud_upload_verified",
+    normalizeText(docId),
+    "firestore_verified_public",
+    normalizeText(verifiedAt),
+    `Production Import Assistant batch ${normalizeText(batchId)}; ${normalizeText(action) || "upserted"}; automatic public metadata and image verification passed.`
+  ];
+}
+
 export function inferRemoteMimeType(contentType = "", fileName = "", sourceUrl = "", rules = null) {
   const rawType = String(contentType || "").split(";")[0].trim().toLowerCase();
   if (rules?.allowedMimeTypes?.has(rawType)) return rawType;

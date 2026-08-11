@@ -57,13 +57,15 @@ The filename normalization matches the proven Apps Script behavior: whitespace b
 
 ## Human surface
 
-The Poetry Please Import Assistant accepts pasted Sheet rows, previews the deterministic IDs and paths, imports valid create/update rows, displays per-row results, and exposes **Retry failed rows**. When called through Firebase Hosting, it processes one item per request so a slow Drive file cannot exceed the gateway's 60-second request deadline. The durable job still contains the whole prepared tranche, and completed rows are never replayed.
+The Poetry Please Import Assistant accepts pasted rows or loads the next 25 unverified ready rows directly from the QI Library by release year. It previews deterministic IDs and paths, imports only valid create/update rows, displays per-row results, and exposes **Retry failed rows** and **Resume latest batch**.
+
+After approval, the browser submits one long-running request directly to the deployed function. The server advances the durable job one item at a time, invalidates the public snapshot, verifies each public record and image response, writes the six audit values to QI Library columns AD:AI, and rereads those cells before reporting success. Closing or refreshing the browser does not change job identity; the saved batch can be resumed without replaying completed rows.
 
 Before a production tranche, use the read-only **Drive access diagnostic** with one source file. It must identify the production service account and return successful metadata and authenticated media reads. This catches Drive permission or deployment drift before any Storage or Firestore write.
 
 ## Spreadsheet role
 
-The old Apps Script remains useful as a row-selection and manifest-preparation model. It should no longer hold a production service-account key or write directly to Firestore. A future thin Sheet client may submit selected rows to this same job API, but it must not implement a second Storage or Firestore engine.
+The old Apps Script remains useful as a row-selection and manifest-preparation model. It should no longer hold a production service-account key or write directly to Firestore. The production service account reads only ready QI Library rows and writes only AD:AI after checking the live row's Drive file ID. A future thin Sheet client may submit selected rows to this same job API, but it must not implement a second Storage or Firestore engine.
 
 ## Production rollout
 
@@ -92,8 +94,9 @@ The canary also established three required production safeguards: preview reads 
 - 2016: 111 of 111 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. This includes 107 rows processed in measured batches plus four earlier rows re-verified during closeout.
 - 2017: 239 of 239 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. The remaining 371 source-year rows stay deferred because they still require poem matching.
 - 2018: 187 of 187 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. The remaining 104 source-year rows stay deferred because they still require poem matching or other enrichment. The final seven Claire Schwartz rows were written by batch `batch-1c38739185faf647c0cf85f8` after the authenticated Drive diagnostic verified the production service identity and source media access.
+- 2019: the first 25 of 306 ready rows completed through the upgraded workflow in batch `batch-99cb8270ce069fbee460b800`. All 25 were publicly verified and automatically written and reread in QI Library AD:AI; 281 ready rows remain.
 
-Production behavior confirmed during the 2016–2017 rollout:
+Production behavior confirmed during the 2016–2019 rollout:
 
 - Source Drive identity wins before metadata matching, so distinct QIs for the same poem do not overwrite one another.
 - Confirmed same-poem variants use explicit, collision-checked canonical `-V2`, `-V3`, and later IDs when needed.
@@ -105,4 +108,4 @@ Production behavior confirmed during the 2016–2017 rollout:
 - Malformed smart quotes in pasted Sheet text can collapse several tab-separated rows into one parse result. Correct the source cell, reread it, and re-preview; do not edit around the parse failure inside the importer.
 - When a legacy poem-title family already contains ambiguous IDs, preview explicit candidate variants and import only the first collision-free ID. The 2018 `CAMARO` row was safely created as `DT-QI-CAMARO-V6`; existing `V2` and `V4` records were not overwritten.
 
-Next recommended year tranches are 2019 (306 ready rows), 2020 (231), 2021 (603), 2022 (575), 2023 (318), 2024 (268), 2025 (402), and 2026 (126). Within a year, use 25-row upload jobs and finish public/API/image/library verification before starting the next job.
+Continue 2019 with its remaining 281 ready rows, then 2020 (231), 2021 (603), 2022 (575), 2023 (318), 2024 (268), 2025 (402), and 2026 (126). Within a year, use 25-row upload jobs; the server now performs public/API/image/library verification before a job reports success.

@@ -14,6 +14,7 @@ import { getAuth } from "firebase-admin/auth";
 import { getStorage, getDownloadURL } from "firebase-admin/storage";
 import { GoogleAuth, Impersonated } from "google-auth-library";
 import {
+  buildQiLibraryWritebackValues,
   canonicalImportManifestJson,
   contentIdSlug,
   deterministicGraphicStoragePath,
@@ -24,8 +25,10 @@ import {
   isCacheGenerationCurrent,
   nextAvailableGraphicVariantId,
   preserveExistingImportValues,
+  selectQiLibraryYearRows,
   shouldCreateSuppliedGraphicVariant,
   shouldForceGraphicAssetReplacement,
+  validateImportedGraphic,
 } from "./uploader-helpers.js";
 
 /** ====== CONFIG / CONSTANTS ====== */
@@ -61,6 +64,10 @@ const REMOTE_AUTH_TIMEOUT_MS = 15000;
 const IMPORT_JOB_MAX_ITEMS = 500;
 const IMPORT_PROCESS_BATCH_SIZE = 25;
 const IMPORT_STALE_PROCESSING_MS = 10 * 60 * 1000;
+const IMPORT_SERVER_RUN_LIMIT_MS = 7 * 60 * 1000;
+const QI_LIBRARY_SPREADSHEET_ID = process.env.QI_LIBRARY_SPREADSHEET_ID || "1vfG1vAc095q_UM08bAOoeUkIEy1s5N2yIb0Q99XF95U";
+const QI_LIBRARY_SHEET_NAME = process.env.QI_LIBRARY_SHEET_NAME || "QI Folder Inventory";
+const QI_LIBRARY_SHEET_ID = Number(process.env.QI_LIBRARY_SHEET_ID || 91745643);
 const UPLOAD_RULES = {
   authorPhoto: {
     allowedMimeTypes: new Set(["image/jpeg", "image/png", "image/webp"]),
@@ -105,6 +112,9 @@ const runtimeCloudAuth = new GoogleAuth({
 });
 const directDriveReadAuth = new GoogleAuth({
   scopes: [DRIVE_READ_SCOPE],
+});
+const qiLibrarySheetsAuth = new GoogleAuth({
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
 });
 const REMOTE_FETCH_TIMEOUT_MS = 4000;
 const CONTENT_CACHE_TTL_MS = 15 * 60 * 1000;
@@ -3015,6 +3025,79 @@ async function writeScoreboardSnapshot(payload) {
 async function getGoogleApiAccessToken() {
   const tokenResult = await appAdmin.options.credential.getAccessToken();
   return tokenResult?.access_token || tokenResult?.accessToken || "";
+}
+
+async function getQiLibrarySheetsAccessToken() {
+  const client = await qiLibrarySheetsAuth.getClient();
+  const tokenResult = await client.getAccessToken();
+  const token = typeof tokenResult === "string" ? tokenResult : tokenResult?.token;
+  if (!token) {
+    const err = new Error("missing_qi_library_sheets_token");
+    err.status = 500;
+    throw err;
+  }
+  return token;
+}
+
+async function getQiLibraryValues(range) {
+  const token = await getQiLibrarySheetsAccessToken();
+  const encodedRange = encodeURIComponent(`'${QI_LIBRARY_SHEET_NAME.replaceAll("'", "''")}'!${range}`);
+  const response = await withStageTimeout(fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${QI_LIBRARY_SPREADSHEET_ID}/values/${encodedRange}?majorDimension=ROWS&valueRenderOption=FORMATTED_VALUE`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  ), 30000, "qi_library_read_timeout");
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    const err = new Error(`qi_library_read_failed:${response.status}:${detail.slice(0, 300)}`);
+    err.status = response.status === 403 ? 403 : 502;
+    throw err;
+  }
+  const payload = await response.json();
+  return Array.isArray(payload.values) ? payload.values : [];
+}
+
+async function writeQiLibraryAuditRow({ rowNumber, sourceDriveFileId, values }) {
+  const safeRow = Number(rowNumber || 0);
+  if (!Number.isInteger(safeRow) || safeRow < 2) throw new Error("invalid_qi_library_row");
+  const current = await getQiLibraryValues(`A${safeRow}:AI${safeRow}`);
+  const currentRow = current[0] || [];
+  if (normalizeText(currentRow[6]) !== normalizeText(sourceDriveFileId)) {
+    const err = new Error("qi_library_source_identity_changed");
+    err.status = 409;
+    throw err;
+  }
+  const token = await getQiLibrarySheetsAccessToken();
+  const encodedRange = encodeURIComponent(`'${QI_LIBRARY_SHEET_NAME.replaceAll("'", "''")}'!AD${safeRow}:AI${safeRow}`);
+  const response = await withStageTimeout(fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${QI_LIBRARY_SPREADSHEET_ID}/values/${encodedRange}?valueInputOption=RAW`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        range: `'${QI_LIBRARY_SHEET_NAME}'!AD${safeRow}:AI${safeRow}`,
+        majorDimension: "ROWS",
+        values: [values],
+      }),
+    },
+  ), 30000, "qi_library_write_timeout");
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    const err = new Error(`qi_library_write_failed:${response.status}:${detail.slice(0, 300)}`);
+    err.status = response.status === 403 ? 403 : 502;
+    throw err;
+  }
+  const result = await response.json();
+  const reread = await getQiLibraryValues(`AD${safeRow}:AI${safeRow}`);
+  const savedValues = (reread[0] || []).map(normalizeText);
+  if (values.map(normalizeText).some((value, index) => savedValues[index] !== value)) {
+    const err = new Error("qi_library_write_verification_failed");
+    err.status = 502;
+    throw err;
+  }
+  return { ...result, verified: true, values: savedValues };
 }
 
 async function createGoogleSheet({ title, headers, rows, shareWithEmail }) {
@@ -6452,6 +6535,110 @@ app.post(getBoth("/admin/contentLibrary/bulkPreview"), async (req, res) => {
   res.json({ ok: true, createCount, updateCount, errorCount, results });
 });
 
+async function verifyCompletedGraphicImportItems(batchId) {
+  const itemSnap = await db.collection(COLLECTIONS.importJobItems)
+    .where("batchId", "==", batchId)
+    .where("state", "==", "complete")
+    .get();
+  const pendingVerification = itemSnap.docs.filter((doc) => {
+    const data = doc.data() || {};
+    const verificationComplete = data.result?.verification?.ok === true;
+    const needsWriteback = !!Number(data.payload?.sourceSpreadsheetRow || 0)
+      && data.result?.libraryWriteback?.verified !== true;
+    return !verificationComplete || needsWriteback;
+  });
+  if (!pendingVerification.length) return { verifiedCount: 0, failedCount: 0 };
+
+  const [allContent, flaggedIds] = await Promise.all([
+    getAllContentCached(),
+    getFlaggedContentIds(),
+  ]);
+  const visibleContent = excludeBrokenContent(excludeFlaggedContent(allContent, flaggedIds));
+  let verifiedCount = 0;
+  let failedCount = 0;
+
+  for (const itemDoc of pendingVerification) {
+    const data = itemDoc.data() || {};
+    const requested = data.payload || {};
+    const result = data.result || {};
+    const contentId = normalizeText(result.id || data.requestedId || requested.docId || requested.imageId);
+    try {
+      const publicItem = visibleContent.find((item) => (
+        normalizeKey(item.imageId) === normalizeKey(contentId)
+        || normalizeKey(item.contentId) === normalizeKey(contentId)
+      ));
+      if (!publicItem) throw new Error("public_content_not_found");
+      const imageResponse = await withStageTimeout(fetch(publicItem.imageUrl, { method: "HEAD" }), 15000, "public_image_verification_timeout");
+      const verification = validateImportedGraphic({
+        requested,
+        saved: publicItem,
+        imageStatus: imageResponse.status,
+        imageContentType: imageResponse.headers.get("content-type") || "",
+      });
+      if (!verification.ok) {
+        const detail = verification.mismatchedFields.length
+          ? `metadata_mismatch:${verification.mismatchedFields.join(",")}`
+          : `image_or_identity_failed:${verification.imageStatus}:${verification.imageContentType}`;
+        throw new Error(detail);
+      }
+
+      let libraryWriteback = result.libraryWriteback || { verified: false, skipped: true };
+      const sourceRow = Number(requested.sourceSpreadsheetRow || 0);
+      if (sourceRow) {
+        if (
+          normalizeText(requested.sourceSpreadsheetId) !== QI_LIBRARY_SPREADSHEET_ID
+          || Number(requested.sourceSpreadsheetSheetId || 0) !== QI_LIBRARY_SHEET_ID
+          || normalizeText(requested.sourceSpreadsheetSheetName) !== QI_LIBRARY_SHEET_NAME
+        ) {
+          throw new Error("qi_library_destination_mismatch");
+        }
+        const verifiedAt = new Date().toISOString();
+        const values = buildQiLibraryWritebackValues({
+          imageUrl: verification.imageUrl,
+          docId: contentId,
+          verifiedAt,
+          batchId,
+          action: result.action,
+        });
+        const writeResult = await writeQiLibraryAuditRow({
+          rowNumber: sourceRow,
+          sourceDriveFileId: requested.sourceDriveFileId,
+          values,
+        });
+        libraryWriteback = {
+          verified: writeResult.verified === true,
+          spreadsheetId: QI_LIBRARY_SPREADSHEET_ID,
+          sheetName: QI_LIBRARY_SHEET_NAME,
+          rowNumber: sourceRow,
+          range: `AD${sourceRow}:AI${sourceRow}`,
+          verifiedAt,
+        };
+      }
+
+      await itemDoc.ref.set({
+        result: {
+          ...result,
+          verification,
+          libraryWriteback,
+        },
+        verifiedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      verifiedCount += 1;
+    } catch (err) {
+      await itemDoc.ref.set({
+        state: "failed",
+        error: `post_upload_verification_failed:${err.message || "verification_failed"}`,
+        errorCode: "post_upload_verification_failed",
+        status: Number(err.status || 0) || null,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      failedCount += 1;
+    }
+  }
+  return { verifiedCount, failedCount };
+}
+
 async function processImportJob(batchId, actor, limit = IMPORT_PROCESS_BATCH_SIZE) {
   const jobRef = db.collection(COLLECTIONS.importJobs).doc(batchId);
   const jobSnap = await jobRef.get();
@@ -6516,12 +6703,17 @@ async function processImportJob(batchId, actor, limit = IMPORT_PROCESS_BATCH_SIZ
       processed.push({ itemId: itemData.itemId, ok: false, error: err.message || "import_failed" });
     }
   }
-  const counts = await updateImportJobCounts(batchId);
+  let counts = await updateImportJobCounts(batchId);
   let publishError = "";
+  let verification = { verifiedCount: 0, failedCount: 0 };
   if (counts.pending === 0 && counts.processing === 0 && counts.completedCount > 0) {
     try {
       await invalidateContentCache({ strict: true });
       await invalidateScoreboardSnapshot(`content_import_job:${batchId}`);
+      if (normalizeKey(job.type) === "graphics") {
+        verification = await verifyCompletedGraphicImportItems(batchId);
+        counts = await updateImportJobCounts(batchId);
+      }
       await jobRef.set({
         state: counts.state,
         publishError: FieldValue.delete(),
@@ -6538,7 +6730,38 @@ async function processImportJob(batchId, actor, limit = IMPORT_PROCESS_BATCH_SIZ
       }, { merge: true });
     }
   }
-  return { batchId, recoveredCount, processed, counts, publishError };
+  return { batchId, recoveredCount, processed, counts, verification, publishError };
+}
+
+async function getImportJobSnapshot(batchId) {
+  const jobSnap = await db.collection(COLLECTIONS.importJobs).doc(batchId).get();
+  if (!jobSnap.exists) return null;
+  const itemSnap = await db.collection(COLLECTIONS.importJobItems).where("batchId", "==", batchId).get();
+  return {
+    job: { id: jobSnap.id, ...(jobSnap.data() || {}) },
+    items: itemSnap.docs
+      .map((doc) => ({ id: doc.id, ...(doc.data() || {}), payload: undefined }))
+      .sort((a, b) => Number(a.index || 0) - Number(b.index || 0)),
+  };
+}
+
+async function runImportJobToCompletion(batchId, actor) {
+  const startedAt = Date.now();
+  let lastResult = null;
+  do {
+    lastResult = await processImportJob(batchId, actor, 1);
+    if ((lastResult.counts?.pending || 0) === 0 && (lastResult.counts?.processing || 0) === 0) break;
+  } while (Date.now() - startedAt < IMPORT_SERVER_RUN_LIMIT_MS);
+  const snapshot = await getImportJobSnapshot(batchId);
+  return {
+    batchId,
+    elapsedMs: Date.now() - startedAt,
+    timedOut: !!(lastResult?.counts?.pending || lastResult?.counts?.processing),
+    counts: lastResult?.counts || {},
+    verification: lastResult?.verification || {},
+    publishError: lastResult?.publishError || "",
+    snapshot,
+  };
 }
 
 app.post(getBoth("/admin/contentLibrary/importJobs"), async (req, res) => {
@@ -6575,16 +6798,28 @@ app.post(getBoth("/admin/contentLibrary/importJobs/:batchId/process"), async (re
   }
 });
 
+app.post(getBoth("/admin/contentLibrary/importJobs/:batchId/run"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  try {
+    const result = await runImportJobToCompletion(req.params.batchId, {
+      uid: ctx.decoded.uid,
+      email: ctx.decoded.email,
+    });
+    res.status(result.timedOut ? 202 : 200).json({ ok: !result.timedOut, ...result });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || "import_job_run_failed" });
+  }
+});
+
 app.get(getBoth("/admin/contentLibrary/importJobs/:batchId"), async (req, res) => {
   const ctx = await requireRole(req, res, ["admin"]);
   if (!ctx) return;
-  const jobSnap = await db.collection(COLLECTIONS.importJobs).doc(req.params.batchId).get();
-  if (!jobSnap.exists) return res.status(404).json({ error: "import_job_not_found" });
-  const itemSnap = await db.collection(COLLECTIONS.importJobItems).where("batchId", "==", req.params.batchId).get();
+  const snapshot = await getImportJobSnapshot(req.params.batchId);
+  if (!snapshot) return res.status(404).json({ error: "import_job_not_found" });
   res.json({
     ok: true,
-    job: { id: jobSnap.id, ...(jobSnap.data() || {}) },
-    items: itemSnap.docs.map((doc) => ({ id: doc.id, ...(doc.data() || {}), payload: undefined })),
+    ...snapshot,
   });
 });
 
@@ -8693,7 +8928,14 @@ function resolveImportAssistantRows(rows = [], defaults = {}, imageType = "QI") 
       pageNumber: normalizeText(row?.pageNumber || ""),
       suppliedDocId,
       suggestedDocId: suppliedDocId || generatedDocId,
-      folderLink: normalizeText(defaults?.driveFolderLink || ""),
+      folderLink: normalizeText(row?.folderLink || defaults?.driveFolderLink || ""),
+      sourceSystem: normalizeText(row?.sourceSystem || ""),
+      sourceRecordId: normalizeText(row?.sourceRecordId || ""),
+      sourceDriveFileId: normalizeText(row?.sourceDriveFileId || ""),
+      sourceSpreadsheetId: normalizeText(row?.sourceSpreadsheetId || ""),
+      sourceSpreadsheetSheetId: Number(row?.sourceSpreadsheetSheetId || 0) || null,
+      sourceSpreadsheetSheetName: normalizeText(row?.sourceSpreadsheetSheetName || ""),
+      sourceSpreadsheetRow: Number(row?.sourceSpreadsheetRow || 0) || null,
     };
     const miscParts = [
       resolvedRow.fileName ? `Import Assistant source file: ${resolvedRow.fileName}` : "",
@@ -8714,6 +8956,13 @@ function resolveImportAssistantRows(rows = [], defaults = {}, imageType = "QI") 
       releaseCatalog: resolvedRow.releaseCatalog,
       pageNumber: resolvedRow.pageNumber,
       bookShortener: resolvedRow.bookShortener,
+      sourceSystem: resolvedRow.sourceSystem,
+      sourceRecordId: resolvedRow.sourceRecordId,
+      sourceDriveFileId: resolvedRow.sourceDriveFileId,
+      sourceSpreadsheetId: resolvedRow.sourceSpreadsheetId,
+      sourceSpreadsheetSheetId: resolvedRow.sourceSpreadsheetSheetId,
+      sourceSpreadsheetSheetName: resolvedRow.sourceSpreadsheetSheetName,
+      sourceSpreadsheetRow: resolvedRow.sourceSpreadsheetRow,
       misc: miscParts.join(" · "),
     };
     return resolvedRow;
@@ -8778,6 +9027,34 @@ function finalizeImportAssistantGraphicRow(row, remoteMedia = null) {
     },
   };
 }
+
+app.get(getBoth("/admin/importAssistant/qiLibraryYear"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  const year = normalizeText(req.query?.year || "");
+  if (!/^20\d{2}$/.test(year)) return res.status(400).json({ error: "invalid_release_year" });
+  const limit = Math.min(Math.max(Number(req.query?.limit) || 25, 1), 25);
+  const offset = Math.max(Number(req.query?.offset) || 0, 0);
+  try {
+    const values = await getQiLibraryValues("A1:AI8000");
+    const selection = selectQiLibraryYearRows(values, { year, limit, offset });
+    res.json({
+      ok: true,
+      ...selection,
+      spreadsheetId: QI_LIBRARY_SPREADSHEET_ID,
+      sheetId: QI_LIBRARY_SHEET_ID,
+      sheetName: QI_LIBRARY_SHEET_NAME,
+      rows: selection.rows.map((row) => ({
+        ...row,
+        sourceSpreadsheetId: QI_LIBRARY_SPREADSHEET_ID,
+        sourceSpreadsheetSheetId: QI_LIBRARY_SHEET_ID,
+        sourceSpreadsheetSheetName: QI_LIBRARY_SHEET_NAME,
+      })),
+    });
+  } catch (err) {
+    res.status(err.status || 502).json({ error: err.message || "qi_library_year_load_failed" });
+  }
+});
 
 app.post(getBoth("/admin/importAssistant/resolve"), async (req, res) => {
   const ctx = await requireRole(req, res, ["admin"]);
