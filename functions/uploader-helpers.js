@@ -233,6 +233,13 @@ export function validateImportedGraphic({ requested = {}, saved = {}, imageStatu
   };
 }
 
+export function verifiedImageContentType(headerContentType = "", detectedContentType = "") {
+  const header = normalizeText(headerContentType).split(";")[0].trim().toLowerCase();
+  if (header.startsWith("image/")) return header;
+  const detected = normalizeText(detectedContentType).split(";")[0].trim().toLowerCase();
+  return detected.startsWith("image/") ? detected : header;
+}
+
 export function buildQiLibraryWritebackValues({ imageUrl = "", docId = "", verifiedAt = "", batchId = "", action = "" } = {}) {
   return [
     normalizeText(imageUrl),

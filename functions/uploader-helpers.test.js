@@ -17,6 +17,7 @@ import {
   shouldForceGraphicAssetReplacement,
   selectQiLibraryYearRows,
   validateImportedGraphic,
+  verifiedImageContentType,
 } from "./uploader-helpers.js";
 
 const graphicRules = {
@@ -270,4 +271,10 @@ test("QI Library writeback has the canonical six audit values", () => {
     "2026-08-11T18:00:00Z",
     "Production Import Assistant batch batch-example; created; automatic public metadata and image verification passed.",
   ]);
+});
+
+test("public image verification falls back to detected bytes for generic object metadata", () => {
+  assert.equal(verifiedImageContentType("application/octet-stream", "image/png"), "image/png");
+  assert.equal(verifiedImageContentType("image/jpeg; charset=binary", "image/png"), "image/jpeg");
+  assert.equal(verifiedImageContentType("application/octet-stream", ""), "application/octet-stream");
 });

@@ -30,6 +30,7 @@ import {
   shouldCreateSuppliedGraphicVariant,
   shouldForceGraphicAssetReplacement,
   validateImportedGraphic,
+  verifiedImageContentType,
 } from "./uploader-helpers.js";
 
 /** ====== CONFIG / CONSTANTS ====== */
@@ -6577,12 +6578,24 @@ async function verifyCompletedGraphicImportItems(batchId) {
         || normalizeKey(item.contentId) === normalizeKey(contentId)
       ));
       if (!publicItem) throw new Error("public_content_not_found");
-      const imageResponse = await withStageTimeout(fetch(publicItem.imageUrl, { method: "HEAD" }), 15000, "public_image_verification_timeout");
+      const imageResponse = await withStageTimeout(fetch(publicItem.imageUrl, {
+        method: "GET",
+        headers: { Range: "bytes=0-511" },
+      }), 15000, "public_image_verification_timeout");
+      const imageBytes = Buffer.from(await withStageTimeout(
+        imageResponse.arrayBuffer(),
+        15000,
+        "public_image_verification_body_timeout",
+      ));
+      const imageContentType = verifiedImageContentType(
+        imageResponse.headers.get("content-type") || "",
+        detectImageMimeType(imageBytes.subarray(0, 512)),
+      );
       const verification = validateImportedGraphic({
         requested,
         saved: publicItem,
         imageStatus: imageResponse.status,
-        imageContentType: imageResponse.headers.get("content-type") || "",
+        imageContentType,
       });
       if (!verification.ok) {
         const detail = verification.mismatchedFields.length
