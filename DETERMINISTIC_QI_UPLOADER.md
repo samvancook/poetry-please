@@ -59,6 +59,8 @@ The filename normalization matches the proven Apps Script behavior: whitespace b
 
 The Poetry Please Import Assistant accepts pasted rows or loads the next 25 unverified ready rows directly from the QI Library by release year. It previews deterministic IDs and paths, imports only valid create/update rows, displays per-row results, and exposes **Retry failed rows** and **Resume latest batch**.
 
+The **Run year** coordinator repeats that exact 25-row workflow automatically. It checkpoints after every verified child job, spaces children across Google Sheets quota windows, stops on any invalid/review/failed row, and automatically starts another bounded server window until the year is complete.
+
 After approval, the browser submits one long-running request directly to the deployed function. The server advances the durable job one item at a time, invalidates the public snapshot, verifies each public record and image response, writes the six audit values to QI Library columns AD:AI, and rereads those cells before reporting success. Closing or refreshing the browser does not change job identity; the saved batch can be resumed without replaying completed rows.
 
 Before a production tranche, use the read-only **Drive access diagnostic** with one source file. It must identify the production service account and return successful metadata and authenticated media reads. This catches Drive permission or deployment drift before any Storage or Firestore write.
@@ -95,6 +97,8 @@ The canary also established three required production safeguards: preview reads 
 - 2017: 239 of 239 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. The remaining 371 source-year rows stay deferred because they still require poem matching.
 - 2018: 187 of 187 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. The remaining 104 source-year rows stay deferred because they still require poem matching or other enrichment. The final seven Claire Schwartz rows were written by batch `batch-1c38739185faf647c0cf85f8` after the authenticated Drive diagnostic verified the production service identity and source media access.
 - 2019: 306 of 306 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. Every job used automatic public verification and AD:AI writeback; the final six rows completed in batch `batch-2ca990cf86ef4f65ecb8d15c`.
+- 2020: 231 of 231 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library.
+- 2021: 603 of 603 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. The Run Year coordinator completed the final 327 rows through quota-paced, 25-row child jobs plus a final 18-row child.
 
 Production behavior confirmed during the 2016–2019 rollout:
 
@@ -109,4 +113,4 @@ Production behavior confirmed during the 2016–2019 rollout:
 - Malformed smart quotes in pasted Sheet text can collapse several tab-separated rows into one parse result. Correct the source cell, reread it, and re-preview; do not edit around the parse failure inside the importer.
 - When a legacy poem-title family already contains ambiguous IDs, preview explicit candidate variants and import only the first collision-free ID. The 2018 `CAMARO` row was safely created as `DT-QI-CAMARO-V6`; existing `V2` and `V4` records were not overwritten.
 
-Continue with 2020 (231), then 2021 (603), 2022 (575), 2023 (318), 2024 (268), 2025 (402), and 2026 (126). Within a year, use 25-row upload jobs; the server performs public/API/image/library verification before a job reports success.
+Continue with 2022 (575), then 2023 (318), 2024 (268), 2025 (402), and 2026 (126). Use **Run year**; the coordinator retains the 25-row safety boundary and the server performs public/API/image/library verification before advancing.

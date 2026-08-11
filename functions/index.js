@@ -6786,6 +6786,89 @@ async function runImportJobToCompletion(batchId, actor) {
   };
 }
 
+async function runQiLibraryYearToCheckpoint(year, actor) {
+  const startedAt = Date.now();
+  const coordinatorRef = db.collection(COLLECTIONS.systemState).doc(`qi-library-year-${year}`);
+  const batches = [];
+  let stopReason = "";
+  let reviewRows = [];
+
+  while (Date.now() - startedAt < 420000) {
+    const values = await getQiLibraryValues("A1:AI8000");
+    const selection = selectQiLibraryYearRows(values, { year, limit: 25, offset: 0 });
+    if (!selection.rows.length) {
+      stopReason = "complete";
+      break;
+    }
+    const sourceRows = selection.rows.map((row) => ({
+      ...row,
+      sourceSpreadsheetId: QI_LIBRARY_SPREADSHEET_ID,
+      sourceSpreadsheetSheetId: QI_LIBRARY_SHEET_ID,
+      sourceSpreadsheetSheetName: QI_LIBRARY_SHEET_NAME,
+    }));
+    const preview = await buildImportAssistantGraphicPreview(sourceRows, "QI", {});
+    if (preview.invalidCount || preview.reviewCount || preview.validCount !== sourceRows.length) {
+      stopReason = "review_required";
+      reviewRows = preview.rows.filter((row) => !row.validation?.ok || !["create", "update"].includes(row.action));
+      break;
+    }
+    const items = preview.rows.map((row) => row.contentItem).filter(Boolean);
+    const job = await createImportJob({ type: "graphics", items, actor });
+    const run = await runImportJobToCompletion(job.id, actor);
+    const failed = (run.snapshot?.items || []).filter((item) => item.state === "failed");
+    const verifiedCount = (run.snapshot?.items || []).filter((item) => item.result?.verification?.ok).length;
+    const writebackCount = (run.snapshot?.items || []).filter((item) => item.result?.libraryWriteback?.verified).length;
+    batches.push({ batchId: job.id, itemCount: items.length, verifiedCount, writebackCount, failedCount: failed.length });
+    await coordinatorRef.set({
+      year,
+      state: failed.length || run.publishError ? "blocked" : "running",
+      lastBatchId: job.id,
+      completedBatchCount: FieldValue.increment(1),
+      lastVerifiedCount: verifiedCount,
+      lastWritebackCount: writebackCount,
+      updatedAt: FieldValue.serverTimestamp(),
+      updatedBy: actor.email || actor.uid || "",
+    }, { merge: true });
+    if (failed.length || run.publishError || run.timedOut) {
+      stopReason = failed.length ? "batch_failed" : (run.publishError ? "publication_failed" : "batch_timed_out");
+      break;
+    }
+    // A verified 25-row child performs two read checks per Sheet row. Keep
+    // successive children in separate rolling quota windows.
+    await new Promise((resolve) => setTimeout(resolve, 65000));
+  }
+
+  let finalValues;
+  try {
+    finalValues = await getQiLibraryValues("A1:AI8000");
+  } catch (err) {
+    if (!String(err.message || "").includes("qi_library_read_failed:429")) throw err;
+    await new Promise((resolve) => setTimeout(resolve, 65000));
+    finalValues = await getQiLibraryValues("A1:AI8000");
+  }
+  const finalSelection = selectQiLibraryYearRows(finalValues, { year, limit: 1, offset: 0 });
+  const complete = finalSelection.remainingCount === 0;
+  if (!stopReason) stopReason = complete ? "complete" : "checkpoint";
+  await coordinatorRef.set({
+    year,
+    state: complete ? "complete" : (stopReason === "checkpoint" ? "checkpoint" : "blocked"),
+    remainingCount: finalSelection.remainingCount,
+    stopReason,
+    updatedAt: FieldValue.serverTimestamp(),
+    updatedBy: actor.email || actor.uid || "",
+  }, { merge: true });
+  return {
+    year,
+    complete,
+    stopReason,
+    remainingCount: finalSelection.remainingCount,
+    readyCount: finalSelection.readyCount,
+    batches,
+    reviewRows,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
 app.post(getBoth("/admin/contentLibrary/importJobs"), async (req, res) => {
   const ctx = await requireRole(req, res, ["admin"]);
   if (!ctx) return;
@@ -6831,6 +6914,19 @@ app.post(getBoth("/admin/contentLibrary/importJobs/:batchId/run"), async (req, r
     res.status(result.timedOut ? 202 : 200).json({ ok: !result.timedOut, ...result });
   } catch (err) {
     res.status(err.status || 400).json({ error: err.message || "import_job_run_failed" });
+  }
+});
+
+app.post(getBoth("/admin/importAssistant/qiLibraryYear/run"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  const year = normalizeText(req.body?.year || "");
+  if (!/^20\d{2}$/.test(year)) return res.status(400).json({ error: "invalid_release_year" });
+  try {
+    const result = await runQiLibraryYearToCheckpoint(year, { uid: ctx.decoded.uid, email: ctx.decoded.email });
+    res.status(result.complete ? 200 : 202).json({ ok: result.complete || result.stopReason === "checkpoint", ...result });
+  } catch (err) {
+    res.status(err.status || 400).json({ error: err.message || "qi_library_year_run_failed" });
   }
 });
 
@@ -9088,13 +9184,8 @@ app.post(getBoth("/admin/importAssistant/resolve"), async (req, res) => {
   res.json({ resolved });
 });
 
-app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => {
-  const ctx = await requireRole(req, res, ["admin"]);
-  if (!ctx) return;
-
-  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
-  const imageType = normalizeText(req.body?.imageType || "QI") || "QI";
-  const resolved = resolveImportAssistantRows(rows, req.body?.defaults || {}, imageType);
+async function buildImportAssistantGraphicPreview(rows = [], imageType = "QI", defaults = {}) {
+  const resolved = resolveImportAssistantRows(rows, defaults, imageType);
   const results = [];
   const usedDocIds = new Set();
   const finalizedRows = await mapWithConcurrency(resolved, 6, async (row) => {
@@ -9164,7 +9255,7 @@ app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => 
   const validCount = results.filter((row) => row.validation?.ok).length;
   const invalidCount = results.length - validCount;
   const suffixCount = results.filter((row) => Number(row.collisionSuffixApplied || 0) > 1).length;
-  res.json({
+  return {
     ok: true,
     rows: results,
     createCount,
@@ -9175,7 +9266,15 @@ app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => 
     suffixCount,
     canImport: validCount > 0,
     previewedAt: new Date().toISOString(),
-  });
+  };
+}
+
+app.post(getBoth("/admin/importAssistant/previewGraphics"), async (req, res) => {
+  const ctx = await requireRole(req, res, ["admin"]);
+  if (!ctx) return;
+  const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+  const imageType = normalizeText(req.body?.imageType || "QI") || "QI";
+  res.json(await buildImportAssistantGraphicPreview(rows, imageType, req.body?.defaults || {}));
 });
 
 

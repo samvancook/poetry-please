@@ -667,6 +667,7 @@
           <div class="controls">
             <input id="import-assistant-library-year" type="number" min="2000" max="2100" value="2019" placeholder="2019" />
             <button id="load-import-assistant-library-year" type="button">Load next 25</button>
+            <button id="run-import-assistant-library-year" type="button">Run year</button>
             <button id="resume-import-assistant-batch" type="button" class="secondary" disabled>Resume latest batch</button>
           </div>
           <div id="import-assistant-library-status" class="status">No QI Library year loaded yet.</div>
@@ -936,7 +937,9 @@
       const token = await getIdTokenOrNull();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
-      const directBase = `https://us-central1-${FIREBASE_CONFIG.projectId}.cloudfunctions.net/api/api`;
+      const directBase = FIREBASE_CONFIG.projectId === 'poetry-please'
+        ? 'https://api-ydczirftza-uc.a.run.app/api'
+        : `https://us-central1-${FIREBASE_CONFIG.projectId}.cloudfunctions.net/api/api`;
       let res;
       try {
         res = await fetch(`${directBase}/${path.replace(/^\//, "")}`, {
@@ -2529,6 +2532,44 @@
         libraryStatusEl.className = payload.remainingCount ? 'status success' : 'status';
       } catch (err) {
         console.warn('Could not refresh QI Library year status', err);
+      }
+    }
+
+    async function runImportAssistantLibraryYear() {
+      const year = document.getElementById('import-assistant-library-year').value.trim();
+      const statusEl = document.getElementById('import-assistant-status');
+      const libraryStatusEl = document.getElementById('import-assistant-library-status');
+      const button = document.getElementById('run-import-assistant-library-year');
+      if (!/^20\d{2}$/.test(year)) {
+        libraryStatusEl.textContent = 'Enter a four-digit release year.';
+        libraryStatusEl.className = 'status error';
+        return;
+      }
+      button.disabled = true;
+      try {
+        let result;
+        do {
+          statusEl.textContent = `Running verified ${year} batches server-side…`;
+          statusEl.className = 'status';
+          result = await longRunningApi('admin/importAssistant/qiLibraryYear/run', { body: { year } });
+          const processed = (result.batches || []).reduce((sum, batch) => sum + Number(batch.writebackCount || 0), 0);
+          libraryStatusEl.textContent = `${result.readyCount} ready ${year} rows; ${result.remainingCount} remain. This checkpoint recorded ${processed} verified rows across ${(result.batches || []).length} batches.`;
+          libraryStatusEl.className = result.complete ? 'status success' : 'status';
+          if (!result.complete && result.stopReason !== 'checkpoint') {
+            const review = (result.reviewRows || []).map((row) => row.suggestedDocId || row.fileName || `row ${Number(row.index || 0) + 1}`).join(', ');
+            statusEl.textContent = `Year run stopped: ${result.stopReason}${review ? ` — ${review}` : ''}`;
+            statusEl.className = 'status error';
+            return;
+          }
+        } while (!result.complete);
+        statusEl.textContent = `${year} complete: every ready row is publicly verified and recorded in the QI Library.`;
+        statusEl.className = 'status success';
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = err.message || 'Could not run the QI Library year.';
+        statusEl.className = 'status error';
+      } finally {
+        button.disabled = false;
       }
     }
 
@@ -4389,6 +4430,7 @@
       });
       document.getElementById("run-import-assistant").addEventListener("click", () => runImportAssistant());
       document.getElementById("load-import-assistant-library-year").addEventListener("click", () => loadImportAssistantLibraryYear());
+      document.getElementById("run-import-assistant-library-year").addEventListener("click", () => runImportAssistantLibraryYear());
       document.getElementById("resume-import-assistant-batch").addEventListener("click", () => resumeImportAssistantBatch());
       document.getElementById("run-drive-diagnostic").addEventListener("click", () => runDriveDiagnostic());
       document.getElementById("preview-import-assistant-graphics").addEventListener("click", () => previewImportAssistantGraphics());
