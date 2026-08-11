@@ -22,6 +22,7 @@ import {
   detectRemoteMediaMimeType,
   importGraphicMetadataKey,
   inferRemoteMimeType,
+  isTrustedDistinctQiLibraryAsset,
   isCacheGenerationCurrent,
   nextAvailableGraphicVariantId,
   preserveExistingImportValues,
@@ -4568,6 +4569,12 @@ async function assignImportAssistantGraphicDocId(row = {}, usedIds = new Set(), 
   const sourceCandidates = uniqueById(sourceMatches);
   const metadataCandidates = uniqueById(metadataMatches);
   const incomingSourceKey = importAssistantGraphicSourceKey(item);
+  const trustedDistinctQiLibraryAsset = isTrustedDistinctQiLibraryAsset({
+    sourceSystem: item.sourceSystem,
+    sourceSpreadsheetRow: item.sourceSpreadsheetRow,
+    sourceDriveFileId: item.sourceDriveFileId,
+    sourceMatchCount: sourceCandidates.length,
+  });
   const existingIds = new Set(existingGraphics.map((existing) => (
     normalizeKey(existing.contentId || existing.imageId || existing.id || "")
   )).filter(Boolean));
@@ -4597,7 +4604,7 @@ async function assignImportAssistantGraphicDocId(row = {}, usedIds = new Set(), 
     }
     const exactMetadataMatches = !!metadataKey
       && importAssistantGraphicMetadataKey(exactMatch) === metadataKey;
-    if (!exactMetadataMatches) {
+    if (!exactMetadataMatches && !trustedDistinctQiLibraryAsset) {
       return {
         row: {
           ...row,
@@ -4638,9 +4645,11 @@ async function assignImportAssistantGraphicDocId(row = {}, usedIds = new Set(), 
       action: "create",
     };
   }
-  const metadataFallbackCandidates = incomingSourceKey
-    ? metadataCandidates.filter((existing) => !importAssistantGraphicSourceKey(existing))
-    : metadataCandidates;
+  const metadataFallbackCandidates = trustedDistinctQiLibraryAsset
+    ? []
+    : (incomingSourceKey
+      ? metadataCandidates.filter((existing) => !importAssistantGraphicSourceKey(existing))
+      : metadataCandidates);
   if (metadataFallbackCandidates.length === 1) {
     const matched = applyImportAssistantGraphicMatch(row, metadataFallbackCandidates[0], "author_book_title");
     usedIds.add(normalizeKey(matched.row.suggestedDocId));

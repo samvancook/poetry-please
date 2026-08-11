@@ -106,6 +106,13 @@ export function shouldCreateSuppliedGraphicVariant({ suppliedDocId = "", sourceM
   return !!normalizeText(suppliedDocId) && Number(sourceMatchCount || 0) === 0;
 }
 
+export function isTrustedDistinctQiLibraryAsset({ sourceSystem = "", sourceSpreadsheetRow = 0, sourceDriveFileId = "", sourceMatchCount = 0 } = {}) {
+  return normalizeText(sourceSystem).toLowerCase() === "qi_library"
+    && Number(sourceSpreadsheetRow || 0) >= 2
+    && !!normalizeText(sourceDriveFileId)
+    && Number(sourceMatchCount || 0) === 0;
+}
+
 export function shouldForceGraphicAssetReplacement({
   docId = "",
   requestedForce = false,

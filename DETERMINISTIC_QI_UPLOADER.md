@@ -94,13 +94,14 @@ The canary also established three required production safeguards: preview reads 
 - 2016: 111 of 111 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. This includes 107 rows processed in measured batches plus four earlier rows re-verified during closeout.
 - 2017: 239 of 239 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. The remaining 371 source-year rows stay deferred because they still require poem matching.
 - 2018: 187 of 187 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. The remaining 104 source-year rows stay deferred because they still require poem matching or other enrichment. The final seven Claire Schwartz rows were written by batch `batch-1c38739185faf647c0cf85f8` after the authenticated Drive diagnostic verified the production service identity and source media access.
-- 2019: the first 25 of 306 ready rows completed through the upgraded workflow in batch `batch-99cb8270ce069fbee460b800`. All 25 were publicly verified and automatically written and reread in QI Library AD:AI; 281 ready rows remain.
+- 2019: 306 of 306 ready QI rows are public, metadata-verified, image-verified, and recorded in the QI Library. Every job used automatic public verification and AD:AI writeback; the final six rows completed in batch `batch-2ca990cf86ef4f65ecb8d15c`.
 
 Production behavior confirmed during the 2016–2019 rollout:
 
 - Source Drive identity wins before metadata matching, so distinct QIs for the same poem do not overwrite one another.
 - Confirmed same-poem variants use explicit, collision-checked canonical `-V2`, `-V3`, and later IDs when needed.
 - Variant allocation reads the complete Firestore document-ID family for every proposed base ID before assigning a suffix, including variants created in earlier batches.
+- A distinct trusted QI Library row with a verified source row and Drive file ID may receive the next collision-free variant ID when no existing source match exists. This permits several legitimate graphics for one poem without weakening collision review for pasted/manual rows or known source matches.
 - Public content retains `bookShortener` through its Firestore projection so same-title editions, such as `HELI` (2017) and `HLE` (2021), resolve to the correct catalog. Projection changes bump the durable content-snapshot version so stale snapshots cannot preserve the old mapping.
 - Known-broken IDs force a fresh Storage upload; the exact ID is removed from the broken-content manifest only after the job reports a new Storage path and the public image is verified.
 - A public `contentById` cache miss performs one exact Firestore document lookup before returning 404. It does not rebuild the full content snapshot for an unknown ID, and newly imported canonical IDs resolve immediately across Cloud Run instances.
@@ -108,4 +109,4 @@ Production behavior confirmed during the 2016–2019 rollout:
 - Malformed smart quotes in pasted Sheet text can collapse several tab-separated rows into one parse result. Correct the source cell, reread it, and re-preview; do not edit around the parse failure inside the importer.
 - When a legacy poem-title family already contains ambiguous IDs, preview explicit candidate variants and import only the first collision-free ID. The 2018 `CAMARO` row was safely created as `DT-QI-CAMARO-V6`; existing `V2` and `V4` records were not overwritten.
 
-Continue 2019 with its remaining 281 ready rows, then 2020 (231), 2021 (603), 2022 (575), 2023 (318), 2024 (268), 2025 (402), and 2026 (126). Within a year, use 25-row upload jobs; the server now performs public/API/image/library verification before a job reports success.
+Continue with 2020 (231), then 2021 (603), 2022 (575), 2023 (318), 2024 (268), 2025 (402), and 2026 (126). Within a year, use 25-row upload jobs; the server performs public/API/image/library verification before a job reports success.

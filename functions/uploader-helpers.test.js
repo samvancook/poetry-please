@@ -8,6 +8,7 @@ import {
   detectRemoteMediaMimeType,
   importGraphicMetadataKey,
   inferRemoteMimeType,
+  isTrustedDistinctQiLibraryAsset,
   isCacheGenerationCurrent,
   normalizeStorageObjectName,
   nextAvailableGraphicVariantId,
@@ -89,6 +90,27 @@ test("an explicit unused graphic ID creates a distinct same-poem variant", () =>
     sourceMatchCount: 1,
   }), false);
   assert.equal(shouldCreateSuppliedGraphicVariant({ suppliedDocId: "", sourceMatchCount: 0 }), false);
+});
+
+test("a QI Library row with a new Drive identity is a trusted distinct graphic", () => {
+  assert.equal(isTrustedDistinctQiLibraryAsset({
+    sourceSystem: "qi_library",
+    sourceSpreadsheetRow: 1400,
+    sourceDriveFileId: "drive-new",
+    sourceMatchCount: 0,
+  }), true);
+  assert.equal(isTrustedDistinctQiLibraryAsset({
+    sourceSystem: "qi_library",
+    sourceSpreadsheetRow: 1400,
+    sourceDriveFileId: "drive-new",
+    sourceMatchCount: 1,
+  }), false);
+  assert.equal(isTrustedDistinctQiLibraryAsset({
+    sourceSystem: "manual",
+    sourceSpreadsheetRow: 1400,
+    sourceDriveFileId: "drive-new",
+    sourceMatchCount: 0,
+  }), false);
 });
 
 test("known-broken QI IDs force a fresh asset upload", () => {
