@@ -1,0 +1,8 @@
+:root { color-scheme: light; font-family: system-ui, sans-serif; }
+body { margin: 0; background: #f7f6f4; color: #171717; }
+main { box-sizing: border-box; max-width: 42rem; margin: 10vh auto; padding: 2rem; background: #fff; border-radius: 1rem; box-shadow: 0 8px 32px #00000012; }
+h1 { margin-top: 0; font-size: 1.6rem; }
+p { line-height: 1.5; }
+output { display: block; overflow-wrap: anywhere; margin: 1rem 0; padding: 1rem; font-family: ui-monospace, monospace; background: #f0f0f0; border-radius: .5rem; }
+button { padding: .65rem 1rem; border: 0; border-radius: .4rem; background: #171717; color: #fff; font: inherit; cursor: pointer; }
+[hidden] { display: none !important; }
